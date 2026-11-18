@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "adapter.h"
+#include "agent.h"
 #include "characteristic.h"
 #include "device.h"
 #include "logger.h"
@@ -31,11 +32,17 @@
 static gint opt_timeout = 20;
 static gboolean opt_verbose = FALSE;
 static gboolean opt_reliable = FALSE;
+static gboolean opt_pair = FALSE;
 static gchar **opt_target = NULL;
 
 static const char *target = NULL;
 static GMainLoop *loop = NULL;
 static Adapter *adapter = NULL;
+static Agent *agent = NULL;
+static gboolean pairing_started = FALSE;
+static gboolean reconnecting = FALSE; // after a fresh pairing, until the second link is up
+static guint reconnect_source = 0;
+static guint timeout_source = 0;
 static Device *device = NULL;
 static GByteArray *outq = NULL;   // stdin bytes waiting to be written to RX
 static gboolean write_in_flight = FALSE;
@@ -60,6 +67,25 @@ static void msg(const char *fmt, ...) {
 static void quit(int code) {
     exit_code = code;
     g_main_loop_quit(loop);
+}
+
+static gboolean on_timeout(gpointer data);
+
+static void arm_timeout(void) {
+    if (timeout_source != 0) g_source_remove(timeout_source);
+    timeout_source = g_timeout_add_seconds((guint) MAX(opt_timeout, 1), on_timeout, NULL);
+}
+
+static gboolean on_reconnect(gpointer data) {
+    reconnect_source = 0;
+    debug("reconnecting to %s", binc_device_get_address(device));
+    binc_device_connect(device);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_reconnect(void) {
+    // bluetoothd needs a moment to tear down the old link; connecting right away races with it.
+    if (reconnect_source == 0) reconnect_source = g_timeout_add(1000, on_reconnect, NULL);
 }
 
 static void start_stdin_watch(void);
@@ -168,16 +194,63 @@ static void on_services_resolved(Device *d) {
         binc_device_disconnect(device);
         return;
     }
+    if (opt_pair && binc_device_get_bonding_state(device) != BINC_BONDED) {
+        // A server started with --require-bonding only accepts bonded centrals; bond first and
+        // subscribe from on_bonding_state_changed.
+        debug("pairing with %s", binc_device_get_address(device));
+        pairing_started = TRUE;
+        binc_device_pair(device);
+        return;
+    }
     binc_device_start_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+}
+
+static void on_bonding_state_changed(Device *d, BondingState new_state, BondingState old_state, const GError *error) {
+    if (error != NULL) {
+        msg("pairing failed: %s (is the server pairable?)", error->message);
+        binc_device_disconnect(device);
+        return;
+    }
+    debug("bonding state %d -> %d", old_state, new_state);
+    if (new_state == BINC_BONDED && pairing_started && !tunnel_up) {
+        pairing_started = FALSE;
+        // bluetoothd on the peripheral side only marks us bonded once this first link drops,
+        // so a server with --require-bonding would reject us now. Reconnect; the next link is
+        // encrypted with the stored keys and the server sees a bonded central.
+        debug("bonded, reconnecting so the server sees the bond");
+        reconnecting = TRUE;
+        arm_timeout(); // pairing took part of the budget; give the second link a full one
+        binc_device_disconnect(device);
+    }
+}
+
+static gboolean on_request_authorization(Device *d) {
+    // Only reached for the server we chose to pair with (--pair); Just Works needs no input.
+    return TRUE;
+}
+
+static guint32 on_request_passkey(Device *d) {
+    msg("the server asked for a passkey; only Just Works pairing is supported");
+    return 0;
 }
 
 static void on_connection_state(Device *d, ConnectionState state, const GError *error) {
     if (error != NULL) {
+        if (reconnecting) {
+            debug("reconnect attempt failed (%s), retrying", error->message);
+            schedule_reconnect();
+            return;
+        }
         msg("connect failed: %s", error->message);
         quit(255);
         return;
     }
     debug("%s %s", binc_device_get_address(d), binc_device_get_connection_state_name(d));
+    if (reconnecting) {
+        if (state == BINC_CONNECTED) reconnecting = FALSE;
+        else if (state == BINC_DISCONNECTED) schedule_reconnect();
+        return;
+    }
     if (state == BINC_DISCONNECTED) quit(tunnel_up ? 0 : 255);
 }
 
@@ -188,6 +261,7 @@ static void connect_to(Device *d) {
     binc_device_set_notify_char_cb(device, &on_notify);
     binc_device_set_notify_state_cb(device, &on_notify_state);
     binc_device_set_write_char_cb(device, &on_write);
+    binc_device_set_bonding_state_changed_cb(device, &on_bonding_state_changed);
     debug("connecting to %s (%s)", binc_device_get_address(device),
           binc_device_get_name(device) ? binc_device_get_name(device) : "?");
     binc_device_connect(device);
@@ -237,6 +311,7 @@ static void on_powered(Adapter *a, gboolean state) {
 }
 
 static gboolean on_timeout(gpointer data) {
+    timeout_source = 0;
     if (!tunnel_up) {
         msg("timed out after %d s waiting for %s", opt_timeout, target);
         if (device != NULL) binc_device_disconnect(device);
@@ -259,6 +334,8 @@ int main(int argc, char **argv) {
     GOptionEntry entries[] = {
         {"timeout", 't', 0, G_OPTION_ARG_INT, &opt_timeout, "Seconds to wait for the tunnel (default 20)", "S"},
         {"reliable", 'r', 0, G_OPTION_ARG_NONE, &opt_reliable, "Use write-with-response (slower)", NULL},
+        {"pair", 'p', 0, G_OPTION_ARG_NONE, &opt_pair,
+         "Bond with the server first (needed for servers started with --require-bonding)", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Print progress to stderr", NULL},
         {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_target, NULL, "ADDRESS|NAME"},
         {NULL}};
@@ -294,7 +371,13 @@ int main(int argc, char **argv) {
         msg("no Bluetooth adapter found");
         return 255;
     }
-    g_timeout_add_seconds((guint) MAX(opt_timeout, 1), on_timeout, NULL);
+    if (opt_pair) {
+        // Registered only for --pair, so the client never takes over pairing dialogs otherwise.
+        agent = binc_agent_create(adapter, "/org/bluez/BleSshClientAgent", NO_INPUT_NO_OUTPUT);
+        binc_agent_set_request_authorization_cb(agent, &on_request_authorization);
+        binc_agent_set_request_passkey_cb(agent, &on_request_passkey);
+    }
+    arm_timeout();
     binc_adapter_set_powered_state_cb(adapter, &on_powered);
     if (binc_adapter_get_powered_state(adapter)) {
         start();
@@ -304,6 +387,7 @@ int main(int argc, char **argv) {
 
     g_main_loop_run(loop);
 
+    if (agent != NULL) binc_agent_free(agent);
     if (adapter != NULL) {
         if (binc_adapter_get_discovery_state(adapter) != BINC_DISCOVERY_STOPPED) binc_adapter_stop_discovery(adapter);
         binc_adapter_free(adapter);

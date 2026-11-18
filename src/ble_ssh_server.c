@@ -5,7 +5,8 @@
  * own session with its own TCP connection to sshd, so several clients can be logged in
  * at the same time.
  *
- * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME] [--max-clients 4] [--no-advertise] [--no-power-on] [--verbose]
+ * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME] [--max-clients 4] [--no-advertise] [--no-power-on]
+ *                       [--require-bonding] [--verbose]
  */
 
 #include <errno.h>
@@ -50,6 +51,7 @@ static gint opt_max_clients = 4;
 static gboolean opt_verbose = FALSE;
 static gboolean opt_no_advertise = FALSE;
 static gboolean opt_no_power_on = FALSE;
+static gboolean opt_require_bonding = FALSE;
 
 static GMainLoop *loop = NULL;
 static Adapter *adapter = NULL;
@@ -234,16 +236,83 @@ static Session *session_lookup(const char *address) {
     return session;
 }
 
+// With --require-bonding the characteristics already demand an encrypted link, but an
+// encrypted link can also come from a pairing that wasn't stored. Only accept centrals that
+// are bonded, i.e. that the program owning the agent and pairable setting let in for good.
+static gboolean get_device_bool(const char *path, const char *property, gboolean *value) {
+    GVariant *reply = g_dbus_connection_call_sync(binc_adapter_get_dbus_connection(adapter), "org.bluez", path,
+                                                  "org.freedesktop.DBus.Properties", "Get",
+                                                  g_variant_new("(ss)", "org.bluez.Device1", property),
+                                                  G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, NULL);
+    if (reply == NULL) return FALSE;
+    GVariant *inner = NULL;
+    g_variant_get(reply, "(v)", &inner);
+    const gboolean ok = g_variant_is_of_type(inner, G_VARIANT_TYPE_BOOLEAN);
+    if (ok) *value = g_variant_get_boolean(inner);
+    g_variant_unref(inner);
+    g_variant_unref(reply);
+    return ok;
+}
+
+static gboolean central_is_bonded(const char *address) {
+    // Ask bluetoothd rather than bluez_inc's cached state: for a central that bonded with us
+    // the cached state isn't updated (bluetoothd signals "Bonded", which bluez_inc ignores).
+    Device *device = binc_adapter_get_device_by_address(adapter, address);
+    if (device == NULL) return FALSE;
+    gboolean bonded = FALSE;
+    if (get_device_bool(binc_device_get_path(device), "Bonded", &bonded)) return bonded; // BlueZ >= 5.72
+    return get_device_bool(binc_device_get_path(device), "Paired", &bonded) && bonded;
+}
+
+static void open_or_reject(const char *address, guint16 mtu) {
+    if (session_open(address, mtu) == NULL) {
+        Device *device = binc_adapter_get_device_by_address(adapter, address);
+        if (device != NULL) binc_device_disconnect(device);
+    }
+}
+
+// A fresh pairing can still be completing when the central subscribes: the link is already
+// encrypted, but bluetoothd hasn't reported Bonded yet. Give it a moment before rejecting.
+#define BOND_WAIT_INTERVAL_MS 200
+#define BOND_WAIT_TRIES 25
+
+typedef struct {
+    gchar *address;
+    guint16 mtu;
+    guint tries;
+} BondWait;
+
+static gboolean on_bond_wait(gpointer data) {
+    BondWait *wait = data;
+    Device *device = binc_adapter_get_device_by_address(adapter, wait->address);
+    const gboolean connected = device != NULL && binc_device_get_connection_state(device) == BINC_CONNECTED;
+    if (connected && central_is_bonded(wait->address)) {
+        open_or_reject(wait->address, wait->mtu);
+    } else if (connected && ++wait->tries < BOND_WAIT_TRIES) {
+        return G_SOURCE_CONTINUE;
+    } else if (connected) {
+        msg("%s: rejected, not bonded (--require-bonding)", wait->address);
+        binc_device_disconnect(device);
+    }
+    g_free(wait->address);
+    g_free(wait);
+    return G_SOURCE_REMOVE;
+}
+
 static void on_notify_state(const Application *application, const char *address, const char *service_uuid,
                             const char *char_uuid, gboolean notifying, guint16 mtu) {
     if (!g_str_equal(char_uuid, BLE_SSH_TX_UUID)) return;
     Session *session = session_lookup(address);
     if (notifying) {
         if (session != NULL) session_close(session, "client restarted notifications", FALSE);
-        if (session_open(address, mtu) == NULL) {
-            Device *device = binc_adapter_get_device_by_address(adapter, address);
-            if (device != NULL) binc_device_disconnect(device);
+        if (opt_require_bonding && !central_is_bonded(address)) {
+            BondWait *wait = g_new0(BondWait, 1);
+            wait->address = g_strdup(address);
+            wait->mtu = mtu;
+            g_timeout_add(BOND_WAIT_INTERVAL_MS, on_bond_wait, wait);
+            return;
         }
+        open_or_reject(address, mtu);
     } else if (session != NULL) {
         session_close(session, "notifications stopped", FALSE);
     }
@@ -327,6 +396,8 @@ int main(int argc, char **argv) {
         {"max-clients", 'm', 0, G_OPTION_ARG_INT, &opt_max_clients, "Max simultaneous clients (default 4)", "N"},
         {"no-power-on", 'P', 0, G_OPTION_ARG_NONE, &opt_no_power_on,
          "Never power on the adapter; leave adapter power to another program", NULL},
+        {"require-bonding", 'B', 0, G_OPTION_ARG_NONE, &opt_require_bonding,
+         "Only accept bonded centrals over an encrypted link (pairing is left to the agent owner)", NULL},
         {"no-advertise", 'A', 0, G_OPTION_ARG_NONE, &opt_no_advertise,
          "Only register the GATT service; let another program on this adapter advertise", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Verbose logging, including bluez_inc", NULL},
@@ -376,8 +447,10 @@ int main(int argc, char **argv) {
 
     app = binc_create_application(adapter);
     binc_application_add_service(app, BLE_SSH_SERVICE_UUID);
-    add_char(BLE_SSH_RX_UUID, GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP, "ssh rx");
-    add_char(BLE_SSH_TX_UUID, GATT_CHR_PROP_NOTIFY, "ssh tx");
+    const guint rx_security = opt_require_bonding ? GATT_CHR_PROP_ENCRYPT_WRITE : 0;
+    const guint tx_security = opt_require_bonding ? GATT_CHR_PROP_ENCRYPT_NOTIFY : 0;
+    add_char(BLE_SSH_RX_UUID, GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP | rx_security, "ssh rx");
+    add_char(BLE_SSH_TX_UUID, GATT_CHR_PROP_NOTIFY | tx_security, "ssh tx");
     binc_application_set_char_read_cb(app, &on_char_read);
     binc_application_set_char_write_cb(app, &on_char_write);
     binc_application_set_char_notify_state_cb(app, &on_notify_state);
@@ -403,6 +476,7 @@ int main(int argc, char **argv) {
 
     const guint bluez_watch = g_bus_watch_name_on_connection(connection, "org.bluez", G_BUS_NAME_WATCHER_FLAGS_NONE,
                                                              NULL, on_bluez_vanished, NULL, NULL);
+    if (opt_require_bonding) msg("only bonded centrals are accepted; pairing is handled by the adapter's agent");
     sd_notify_send("READY=1");
     notify_status();
     if (sd_notify_start_watchdog()) msg("systemd watchdog enabled");

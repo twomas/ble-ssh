@@ -47,7 +47,8 @@ Try it in the foreground first:
 
 ```bash
 ./build/ble_ssh_server            # advertises as ssh-<hostname>, forwards to 127.0.0.1:22
-./build/ble_ssh_server --help     # --port, --host, --name, --max-clients, --no-advertise, --no-power-on, --verbose
+./build/ble_ssh_server --help     # --port, --host, --name, --max-clients, --no-advertise,
+                                  # --no-power-on, --require-bonding, --verbose
 ```
 
 ### Next to another BLE peripheral
@@ -75,9 +76,30 @@ adapter is off and becomes reachable when the other program powers it on.
 ./build/ble_ssh_server --no-advertise --no-power-on
 ```
 
-The tunnel's characteristics don't require encryption, so ble-ssh never triggers pairing on
-its own. If you later require a bonded link for the tunnel, pairing goes through the other
-program's agent and pairable setting.
+By default the tunnel's characteristics don't require encryption, so ble-ssh never triggers
+pairing on its own.
+
+### Bonded clients only (`--require-bonding`)
+
+Off by default. With `--require-bonding` the RX/TX characteristics require an encrypted
+link, and the server only opens a session for centrals that bluetoothd reports as **bonded**.
+Other centrals are disconnected before any byte reaches sshd.
+
+ble-ssh doesn't pair anyone itself. Whether a new client may bond is decided by whatever
+owns the adapter's agent and pairable setting: your own GATT server, or `bluetoothctl`
+during development. Revoking a client is `bluetoothctl remove <address>` on the server.
+
+```bash
+./build/ble_ssh_server --no-advertise --no-power-on --require-bonding
+ble_ssh_client --pair AA:BB:CC:DD:EE:FF      # first time: bond, then connect
+ble_ssh_client AA:BB:CC:DD:EE:FF             # later: already bonded
+```
+
+On the peripheral side, bluetoothd only reports a new bond once that first link drops. So
+`--pair` bonds, disconnects and reconnects, and the second link is the one the server
+accepts. Other clients (e.g. a phone app) see the same thing: the first connection after
+pairing is rejected, and the next one works. SSH still provides its own end-to-end
+encryption and authentication on top.
 
 For the systemd service, set the options in `/etc/default/ble-ssh` (see below).
 
@@ -147,6 +169,8 @@ sudo systemctl restart bluetooth        # ble-ssh-server restarts with it (PartO
 | Service fails with `system bus: The connection is closed` | The unit was changed to `DynamicUser=yes`, which `dbus-daemon` rejects. Use the shipped `User=ble-ssh` |
 | The server doesn't show up in a scan | Adapter is powered off (`bluetoothctl show`), or the service isn't running (`systemctl status ble-ssh-server`) |
 | `session opened` is logged but ssh hangs | sshd isn't listening on the configured `--host`/`--port` |
+| Server logs `rejected, not bonded` | The client isn't bonded, or this was the first link right after pairing. Connect again, or use `ble_ssh_client --pair` |
+| Client: `CONNECTED`, then `DISCONNECTED`; the client's bluetoothd logs `No agent available` | Something on the server needs encryption (e.g. PipeWire's BLE-MIDI service on a desktop Linux, or a stale bond on one side only), and the client has no pairing agent. Use `--pair`, or remove the stale bond on both sides |
 
 ### Notes
 
@@ -201,8 +225,10 @@ Host pi-ble
     ProxyCommand ble_ssh_client ssh-raspberrypi
 ```
 
-Options: `--timeout S` (default 20), `--reliable` (write-with-response, slower), `--verbose`
-(progress on stderr).
+Options: `--timeout S` (default 20), `--pair` (bond first, needed once for servers with
+`--require-bonding`), `--reliable` (write-with-response, slower), `--verbose` (progress on
+stderr). `--pair` registers a NoInputNoOutput agent for the duration of the run, so only
+Just Works pairing is supported.
 
 ## Performance
 
