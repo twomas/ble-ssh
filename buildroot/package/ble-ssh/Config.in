@@ -1,0 +1,42 @@
+config BR2_PACKAGE_BLE_SSH
+	bool "ble-ssh"
+	depends on BR2_PACKAGE_BLUEZ5_UTILS # bluetoothd
+	depends on BR2_USE_WCHAR # libglib2
+	depends on BR2_TOOLCHAIN_HAS_THREADS # libglib2
+	depends on BR2_USE_MMU # libglib2
+	select BR2_PACKAGE_LIBGLIB2
+	help
+	  SSH over Bluetooth LE: a GATT tunnel from a BLE central to the
+	  local sshd. Installs ble_ssh_server and, with systemd, the
+	  ble-ssh-server service (enabled) and its system user.
+
+	  The tunnel only carries bytes; an SSH server (OpenSSH or
+	  Dropbear) must be selected separately. bluetoothd needs
+	  "ReverseServiceDiscovery = false" in /etc/bluetooth/main.conf,
+	  typically set from a rootfs overlay.
+
+	  https://github.com/twomas/ble-ssh
+
+if BR2_PACKAGE_BLE_SSH
+
+config BR2_PACKAGE_BLE_SSH_OPTS
+	string "ble_ssh_server options"
+	default ""
+	help
+	  Written to /etc/default/ble-ssh as BLE_SSH_OPTS. Use
+	  "--no-advertise" when another program on the device already
+	  advertises; see ble_ssh_server --help for other options.
+
+config BR2_PACKAGE_BLE_SSH_CLIENT
+	bool "install ble_ssh_client"
+	help
+	  Also install the client (ssh ProxyCommand) on the target.
+
+endif
+
+comment "ble-ssh needs bluez5-utils"
+	depends on !BR2_PACKAGE_BLUEZ5_UTILS
+
+comment "ble-ssh needs a toolchain w/ wchar, threads"
+	depends on BR2_USE_MMU
+	depends on !BR2_USE_WCHAR || !BR2_TOOLCHAIN_HAS_THREADS

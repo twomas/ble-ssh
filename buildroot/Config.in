@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_BLE_SSH_PATH/package/ble-ssh/Config.in"

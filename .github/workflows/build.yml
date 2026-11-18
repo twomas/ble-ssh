@@ -1,0 +1,66 @@
+name: CMake Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev
+
+      - name: Configure CMake
+        run: >
+          cmake -B ${{github.workspace}}/build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_FLAGS="-Werror"
+          -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/install
+
+      - name: Build Project
+        run: cmake --build ${{github.workspace}}/build -- -j$(nproc)
+
+      - name: Install Project
+        run: cmake --install ${{github.workspace}}/build
+
+      - name: Test Installation
+        run: |
+          set -e
+          install=${{github.workspace}}/install
+          ls -lR "$install"
+          test -x "$install/bin/ble_ssh_server"
+          test -x "$install/bin/ble_ssh_client"
+          unit="$install/lib/systemd/system/ble-ssh-server.service"
+          test -f "$unit"
+          test -f "$install/lib/sysusers.d/ble-ssh.conf"
+          grep -qx "ExecStart=$install/bin/ble_ssh_server \$BLE_SSH_OPTS" "$unit"
+          grep -qx "Type=notify" "$unit"
+          "$install/bin/ble_ssh_server" --help > /dev/null
+          "$install/bin/ble_ssh_client" --help > /dev/null
+          echo "Installation test passed."
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ble-ssh-${{ matrix.arch }}
+          path: ${{github.workspace}}/install
+          retention-days: 5

@@ -1,0 +1,3 @@
+# System user for ble-ssh-server.service, created by systemd-sysusers.
+# (DynamicUser= is not used: the classic dbus-daemon rejects dynamic users on the system bus.)
+u ble-ssh - "SSH over Bluetooth LE" - -

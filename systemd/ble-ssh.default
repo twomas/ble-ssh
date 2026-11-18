@@ -1,0 +1,8 @@
+# Options for ble-ssh-server.service, see `ble_ssh_server --help`.
+# Restart the service after changing this file: sudo systemctl restart ble-ssh-server
+#
+# Examples:
+#   BLE_SSH_OPTS="--no-advertise"          # another program on this adapter advertises
+#   BLE_SSH_OPTS="--name my-device -m 2"   # custom advertised name, at most 2 clients
+#   BLE_SSH_OPTS="--port 2222"             # sshd listens on another port
+BLE_SSH_OPTS=""
