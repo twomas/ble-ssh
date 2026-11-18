@@ -25,7 +25,8 @@ config BR2_PACKAGE_BLE_SSH_OPTS
 	help
 	  Written to /etc/default/ble-ssh as BLE_SSH_OPTS. Use
 	  "--no-advertise" when another program on the device already
-	  advertises; see ble_ssh_server --help for other options.
+	  advertises, and "--no-power-on" when that program also owns
+	  adapter power; see ble_ssh_server --help for other options.
 
 config BR2_PACKAGE_BLE_SSH_CLIENT
 	bool "install ble_ssh_client"

@@ -5,7 +5,7 @@
  * own session with its own TCP connection to sshd, so several clients can be logged in
  * at the same time.
  *
- * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME] [--max-clients 4] [--no-advertise] [--verbose]
+ * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME] [--max-clients 4] [--no-advertise] [--no-power-on] [--verbose]
  */
 
 #include <errno.h>
@@ -49,6 +49,7 @@ static gchar *opt_name = NULL;
 static gint opt_max_clients = 4;
 static gboolean opt_verbose = FALSE;
 static gboolean opt_no_advertise = FALSE;
+static gboolean opt_no_power_on = FALSE;
 
 static GMainLoop *loop = NULL;
 static Adapter *adapter = NULL;
@@ -270,6 +271,12 @@ static const char *on_char_read(const Application *application, const char *addr
     return BLUEZ_ERROR_NOT_PERMITTED;
 }
 
+static void on_powered_state_changed(Adapter *a, gboolean powered) {
+    msg("adapter powered %s", powered ? "on" : "off");
+    // BlueZ drops advertisements while the controller is off; put ours back when it returns.
+    if (powered && advertisement != NULL) binc_adapter_start_advertising(a, advertisement);
+}
+
 static void on_central_state_changed(Adapter *a, Device *device) {
     const char *address = binc_device_get_address(device);
     if (opt_verbose) msg("%s: %s", address, binc_device_get_connection_state_name(device));
@@ -318,6 +325,8 @@ int main(int argc, char **argv) {
         {"port", 'p', 0, G_OPTION_ARG_INT, &opt_port, "Backend TCP port (default 22)", "PORT"},
         {"name", 'n', 0, G_OPTION_ARG_STRING, &opt_name, "Advertised name (default ssh-<hostname>)", "NAME"},
         {"max-clients", 'm', 0, G_OPTION_ARG_INT, &opt_max_clients, "Max simultaneous clients (default 4)", "N"},
+        {"no-power-on", 'P', 0, G_OPTION_ARG_NONE, &opt_no_power_on,
+         "Never power on the adapter; leave adapter power to another program", NULL},
         {"no-advertise", 'A', 0, G_OPTION_ARG_NONE, &opt_no_advertise,
          "Only register the GATT service; let another program on this adapter advertise", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Verbose logging, including bluez_inc", NULL},
@@ -352,7 +361,15 @@ int main(int argc, char **argv) {
         msg("no Bluetooth adapter found");
         return 1;
     }
-    if (!binc_adapter_get_powered_state(adapter)) binc_adapter_power_on(adapter);
+    binc_adapter_set_powered_state_cb(adapter, &on_powered_state_changed);
+    if (!binc_adapter_get_powered_state(adapter)) {
+        if (opt_no_power_on) {
+            // The GATT service registers fine while off and becomes reachable once powered.
+            msg("adapter is powered off; waiting for another program to power it on");
+        } else {
+            binc_adapter_power_on(adapter);
+        }
+    }
     binc_adapter_set_remote_central_cb(adapter, &on_central_state_changed);
 
     sessions = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, session_free);

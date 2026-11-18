@@ -47,7 +47,7 @@ Try it in the foreground first:
 
 ```bash
 ./build/ble_ssh_server            # advertises as ssh-<hostname>, forwards to 127.0.0.1:22
-./build/ble_ssh_server --help     # --port, --host, --name, --max-clients, --no-advertise, --verbose
+./build/ble_ssh_server --help     # --port, --host, --name, --max-clients, --no-advertise, --no-power-on, --verbose
 ```
 
 ### Next to another BLE peripheral
@@ -65,7 +65,21 @@ two programs don't interfere with each other. Clients then have to connect by Bl
 address (`ble_ssh_client AA:BB:CC:DD:EE:FF`): the advertised name and service UUID belong
 to the other program, so lookup by name won't find the server.
 
-For the systemd service, set it in `/etc/default/ble-ssh` (see below).
+ble-ssh never changes adapter-wide settings: pairable, discoverable, the pairing agent and
+the alias are all left to the other program. The only exception is power: by default the
+server powers on an adapter that is off. Add `--no-power-on` if the other program owns
+adapter power too (for example a low-power mode). The GATT service is registered while the
+adapter is off and becomes reachable when the other program powers it on.
+
+```bash
+./build/ble_ssh_server --no-advertise --no-power-on
+```
+
+The tunnel's characteristics don't require encryption, so ble-ssh never triggers pairing on
+its own. If you later require a bonded link for the tunnel, pairing goes through the other
+program's agent and pairable setting.
+
+For the systemd service, set the options in `/etc/default/ble-ssh` (see below).
 
 ### Run as a systemd service
 

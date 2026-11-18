@@ -3,6 +3,7 @@
 #
 # Examples:
 #   BLE_SSH_OPTS="--no-advertise"          # another program on this adapter advertises
+#   BLE_SSH_OPTS="--no-advertise --no-power-on"   # ...and also owns adapter power
 #   BLE_SSH_OPTS="--name my-device -m 2"   # custom advertised name, at most 2 clients
 #   BLE_SSH_OPTS="--port 2222"             # sshd listens on another port
 BLE_SSH_OPTS=""
