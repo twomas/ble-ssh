@@ -47,9 +47,13 @@ Try it in the foreground first:
 
 ```bash
 ./build/ble_ssh_server            # advertises as ssh-<hostname>, forwards to 127.0.0.1:22
-./build/ble_ssh_server --help     # --port, --host, --name, --max-clients, --no-advertise,
-                                  # --no-power-on, --require-bonding, --verbose
+./build/ble_ssh_server --help     # --port, --host, --name, --adapter-name, --max-clients,
+                                  # --no-advertise, --no-power-on, --require-bonding, --verbose
 ```
+
+To advertise under the name the device already has, use `--adapter-name`: the server
+advertises the adapter's Bluetooth name (its `Alias`) and follows it when it changes, so it
+doesn't matter whether the program that sets the name starts before or after ble-ssh.
 
 ### Next to another BLE peripheral
 

@@ -5,8 +5,8 @@
  * own session with its own TCP connection to sshd, so several clients can be logged in
  * at the same time.
  *
- * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME] [--max-clients 4] [--no-advertise] [--no-power-on]
- *                       [--require-bonding] [--verbose]
+ * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME | --adapter-name] [--max-clients 4]
+ *                       [--no-advertise] [--no-power-on] [--require-bonding] [--verbose]
  */
 
 #include <errno.h>
@@ -52,6 +52,7 @@ static gboolean opt_verbose = FALSE;
 static gboolean opt_no_advertise = FALSE;
 static gboolean opt_no_power_on = FALSE;
 static gboolean opt_require_bonding = FALSE;
+static gboolean opt_adapter_name = FALSE;
 
 static GMainLoop *loop = NULL;
 static Adapter *adapter = NULL;
@@ -265,6 +266,21 @@ static gboolean get_device_bool(const char *path, const char *property, gboolean
     return ok;
 }
 
+static gchar *adapter_alias(void) {
+    // Read from bluetoothd: bluez_inc declares binc_adapter_get_alias() but doesn't implement it.
+    GVariant *reply = g_dbus_connection_call_sync(binc_adapter_get_dbus_connection(adapter), "org.bluez",
+                                                  binc_adapter_get_path(adapter), "org.freedesktop.DBus.Properties",
+                                                  "Get", g_variant_new("(ss)", "org.bluez.Adapter1", "Alias"),
+                                                  G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, NULL);
+    if (reply == NULL) return NULL;
+    GVariant *inner = NULL;
+    g_variant_get(reply, "(v)", &inner);
+    gchar *alias = g_variant_is_of_type(inner, G_VARIANT_TYPE_STRING) ? g_variant_dup_string(inner, NULL) : NULL;
+    g_variant_unref(inner);
+    g_variant_unref(reply);
+    return alias;
+}
+
 static gboolean central_is_bonded(const char *address) {
     // Ask bluetoothd rather than bluez_inc's cached state: for a central that bonded with us
     // the cached state isn't updated (bluetoothd signals "Bonded", which bluez_inc ignores).
@@ -362,6 +378,28 @@ static void on_powered_state_changed(Adapter *a, gboolean powered) {
     if (powered && advertisement != NULL) binc_adapter_start_advertising(a, advertisement);
 }
 
+static void on_adapter_properties_changed(G_GNUC_UNUSED GDBusConnection *connection, G_GNUC_UNUSED const gchar *sender,
+                                          G_GNUC_UNUSED const gchar *path, G_GNUC_UNUSED const gchar *interface,
+                                          G_GNUC_UNUSED const gchar *signal, GVariant *parameters,
+                                          G_GNUC_UNUSED gpointer user_data) {
+    // --adapter-name: follow the adapter's Alias, so it doesn't matter whether the program that
+    // sets it starts before or after us.
+    GVariant *changed = g_variant_get_child_value(parameters, 1);
+    const gchar *alias = NULL;
+    if (g_variant_lookup(changed, "Alias", "&s", &alias) && alias[0] != '\0' && g_strcmp0(alias, opt_name) != 0) {
+        msg("adapter name changed to '%s', advertising that", alias);
+        g_free(opt_name);
+        opt_name = g_strdup(alias);
+        if (advertisement != NULL) {
+            // BlueZ reads the name when the advertisement is registered: register it again.
+            binc_adapter_stop_advertising(adapter, advertisement);
+            binc_advertisement_set_local_name(advertisement, opt_name);
+            if (binc_adapter_get_powered_state(adapter)) binc_adapter_start_advertising(adapter, advertisement);
+        }
+    }
+    g_variant_unref(changed);
+}
+
 static void on_central_state_changed(Adapter *a, Device *device) {
     const char *address = binc_device_get_address(device);
     if (opt_verbose) msg("%s: %s", address, binc_device_get_connection_state_name(device));
@@ -409,6 +447,8 @@ int main(int argc, char **argv) {
         {"host", 'H', 0, G_OPTION_ARG_STRING, &opt_host, "Backend host (default 127.0.0.1)", "HOST"},
         {"port", 'p', 0, G_OPTION_ARG_INT, &opt_port, "Backend TCP port (default 22)", "PORT"},
         {"name", 'n', 0, G_OPTION_ARG_STRING, &opt_name, "Advertised name (default ssh-<hostname>)", "NAME"},
+        {"adapter-name", 'N', 0, G_OPTION_ARG_NONE, &opt_adapter_name,
+         "Advertise the adapter's own Bluetooth name (its Alias) instead of ssh-<hostname>", NULL},
         {"max-clients", 'm', 0, G_OPTION_ARG_INT, &opt_max_clients, "Max simultaneous clients (default 4)", "N"},
         {"no-power-on", 'P', 0, G_OPTION_ARG_NONE, &opt_no_power_on,
          "Never power on the adapter; leave adapter power to another program", NULL},
@@ -426,8 +466,12 @@ int main(int argc, char **argv) {
         return 2;
     }
     g_option_context_free(context);
+    if (opt_name != NULL && opt_adapter_name) {
+        msg("--name and --adapter-name are mutually exclusive");
+        return 2;
+    }
     if (opt_host == NULL) opt_host = g_strdup("127.0.0.1");
-    if (opt_name == NULL) opt_name = default_name();
+    if (opt_name == NULL && !opt_adapter_name) opt_name = default_name();
     if (opt_max_clients < 1) opt_max_clients = 1;
 
     log_enabled(opt_verbose);
@@ -447,6 +491,16 @@ int main(int argc, char **argv) {
     if (adapter == NULL) {
         msg("no Bluetooth adapter found");
         return 1;
+    }
+    if (opt_adapter_name) {
+        // The name the device already goes by (bluetoothd's Alias, often set by the program
+        // that owns the adapter), read once at startup.
+        opt_name = adapter_alias();
+        if (opt_name == NULL || opt_name[0] == '\0') {
+            g_free(opt_name);
+            opt_name = default_name();
+            msg("could not read the adapter's name, advertising '%s'", opt_name);
+        }
     }
     binc_adapter_set_powered_state_cb(adapter, &on_powered_state_changed);
     if (!binc_adapter_get_powered_state(adapter)) {
@@ -492,6 +546,11 @@ int main(int argc, char **argv) {
 
     const guint bluez_watch = g_bus_watch_name_on_connection(connection, "org.bluez", G_BUS_NAME_WATCHER_FLAGS_NONE,
                                                              NULL, on_bluez_vanished, NULL, NULL);
+    const guint alias_watch = opt_adapter_name && !opt_no_advertise
+        ? g_dbus_connection_signal_subscribe(connection, "org.bluez", "org.freedesktop.DBus.Properties",
+                                             "PropertiesChanged", binc_adapter_get_path(adapter), "org.bluez.Adapter1",
+                                             G_DBUS_SIGNAL_FLAGS_NONE, on_adapter_properties_changed, NULL, NULL)
+        : 0;
     if (opt_require_bonding) msg("only bonded centrals are accepted; pairing is handled by the adapter's agent");
     sd_notify_send("READY=1");
     notify_status();
@@ -499,6 +558,7 @@ int main(int argc, char **argv) {
 
     g_main_loop_run(loop);
     g_bus_unwatch_name(bluez_watch);
+    if (alias_watch != 0) g_dbus_connection_signal_unsubscribe(connection, alias_watch);
 
     GList *open = g_hash_table_get_values(sessions);
     for (GList *it = open; it != NULL; it = it->next) session_close(it->data, "server stopping", TRUE);
