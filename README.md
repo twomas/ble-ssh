@@ -235,7 +235,7 @@ There are two clients with the same command line:
 | | `ble_ssh_client` (C) | `ble-ssh-client` (Python) |
 |---|---|---|
 | Platforms | Linux (BlueZ) | Windows, macOS, Linux |
-| Dependencies | none at runtime | Python 3.9+, [bleak](https://github.com/hbldh/bleak) |
+| Dependencies | none at runtime | Python 3.10+, [bleak](https://github.com/hbldh/bleak) |
 | Install | built with the server | `pipx install ./clients/python` |
 | Use it for | embedded and headless Linux | developer laptops |
 
