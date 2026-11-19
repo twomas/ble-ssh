@@ -22,5 +22,8 @@ classifiers = [
 [project.scripts]
 ble-ssh-client = "ble_ssh_client.cli:main"
 
+[project.gui-scripts]
+ble-ssh-gui = "ble_ssh_client.gui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

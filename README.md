@@ -249,6 +249,9 @@ ble-ssh-client --ssh-config ssh-server --user pi | Add-Content -Encoding ascii $
 ssh server-ble
 ```
 
+Or click through it: `ble-ssh-gui` scans, opens an ssh session in a terminal window and
+saves the alias (tkinter; on Debian/Ubuntu `sudo apt install python3-tk`).
+
 The client must run on another machine than the server (one adapter cannot connect to
 itself). Use it as an ssh `ProxyCommand`, with the server's Bluetooth address or advertised
 name:

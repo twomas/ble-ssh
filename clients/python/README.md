@@ -27,6 +27,10 @@ which ssh can't read.
 ble-ssh-client --ssh-config ssh-server --user pi | Add-Content -Encoding ascii $HOME\.ssh\config
 ```
 
+Or use the small GUI: `ble-ssh-gui` lists servers, opens an ssh session in a new terminal
+window, saves the alias to `~/.ssh/config` and remembers the login user per server. It needs
+tkinter, which ships with Python on Windows and macOS; on Debian/Ubuntu install `python3-tk`.
+
 | Option | |
 |--------|-|
 | `ADDRESS\|NAME` | Bluetooth address, or the server's advertised name (`ssh-<hostname>`) |
@@ -37,7 +41,8 @@ ble-ssh-client --ssh-config ssh-server --user pi | Add-Content -Encoding ascii $
 | `-p, --pair` | Bond first, then reconnect (once, for servers with `--require-bonding`) |
 | `-t, --timeout S` | Seconds to wait for the server (default 20) |
 | `-r, --reliable` | Write-with-response (slower) |
-| `-v, --verbose` | Progress on stderr, with timestamps |
+| `--progress` | One status line per step on stderr (looking, connecting, connected); `--ssh-config` and the GUI turn it on |
+| `-v, --verbose` | Detailed progress on stderr, with timestamps |
 
 Platform notes:
 

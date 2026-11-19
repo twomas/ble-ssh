@@ -35,6 +35,15 @@ MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$")  # macOS device ids
 
 verbose = False
+show_progress = False
+
+
+def progress(message: str) -> None:
+    """A short status line for people watching the terminal (--progress); -v says it with timestamps."""
+    if verbose:
+        debug(message)
+    elif show_progress:
+        log(message)
 
 
 def log(message: str) -> None:
@@ -159,11 +168,16 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
         if which is active[0]:
             disconnected.set()
 
+    attempt = 0
     while (remaining := deadline - loop.time()) > 0:
+        attempt += 1
+        if attempt == 1:
+            progress(f"looking for {args.target} over Bluetooth ...")
         device = await find_device(args.target, remaining)
         if device is None:
             break
         debug(f"found {device.address} ({device.name or '?'})")
+        progress(f"connecting to {device.address}" + (f" (attempt {attempt})" if attempt > 1 else "") + " ...")
         client = BleakClient(device, timeout=max(remaining, 1.0), disconnected_callback=on_disconnect)
         active[0] = client
         disconnected.clear()
@@ -175,9 +189,17 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
             log(str(error))
             await client.disconnect()
             return None
-        except (BleakError, asyncio.TimeoutError, OSError) as error:
-            last_error = error
-            debug(f"setup failed ({error}), retrying")
+        except (BleakError, asyncio.TimeoutError, OSError, asyncio.CancelledError) as error:
+            # WinRT reports an aborted GATT operation (e.g. while another program scans) as
+            # CancelledError. Retry that, but let a real cancellation of this task through.
+            current = asyncio.current_task()
+            if isinstance(error, asyncio.CancelledError) and current is not None and getattr(current, "cancelling", lambda: 0)():
+                raise
+            last_error = error if str(error) else BleakError("GATT operation cancelled")
+            if verbose:
+                debug(f"setup failed ({last_error}), retrying")
+            else:
+                progress(f"not yet ({last_error}), retrying ...")
             active[0] = None  # whatever this attempt reports from now on is history
             try:
                 await asyncio.wait_for(client.disconnect(), 3.0)
@@ -185,6 +207,11 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
                 pass
             await asyncio.sleep(1.0)
     log(f"connect failed: {last_error}" if last_error else f"timed out after {args.timeout:g} s waiting for {args.target}")
+    if last_error is not None and "-2147483629" in str(last_error):  # WinRT: "the object has been closed"
+        log("Windows kept closing the connection. Another program using Bluetooth at the same time "
+            "(a scan, or another connection to this device) is the usual cause; close it and try again.")
+    elif last_error is None:
+        log("is the server in range and running? Servers started with --no-advertise must be reached by address.")
     return None
 
 
@@ -219,6 +246,8 @@ async def run(args: argparse.Namespace) -> int:
 
     try:
         debug(f"tunnel up (chunk {size} bytes)")
+        if not verbose:
+            progress("connected, starting the SSH session")
 
         queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STDIN_QUEUE_DEPTH)
         start_stdin_reader(loop, queue)
@@ -259,17 +288,38 @@ async def run(args: argparse.Namespace) -> int:
             debug("disconnected")
 
 
+async def scan_devices(seconds: float, show_all: bool) -> list:
+    """Nearby ble-ssh servers (or, with show_all, every named BLE device), strongest first,
+    as (rssi, name, address, is_ble_ssh) tuples."""
+    seen: dict = {}
+    async with BleakScanner(lambda device, adv: merge_advertisement(seen, device, adv)):
+        await asyncio.sleep(seconds)
+    return scan_rows(seen, show_all)
+
+
+def merge_advertisement(seen: dict, device: BLEDevice, adv) -> None:
+    """Fold one advertisement into SEEN (address -> entry).
+
+    Many devices alternate between packets with and without their name or service list (for
+    example when they multiplex several advertisements), so keeping only the last packet
+    would drop them at random.
+    """
+    entry = seen.setdefault(device.address, {"name": None, "ble_ssh": False, "rssi": adv.rssi})
+    entry["name"] = adv.local_name or device.name or entry["name"]
+    entry["ble_ssh"] = entry["ble_ssh"] or SERVICE_UUID in (u.lower() for u in adv.service_uuids)
+    entry["rssi"] = adv.rssi
+
+
+def scan_rows(seen: dict, show_all: bool) -> list:
+    rows = [(e["rssi"], e["name"] or "?", address, e["ble_ssh"]) for address, e in list(seen.items())
+            if e["ble_ssh"] or (show_all and e["name"])]
+    rows.sort(reverse=True)
+    return rows
+
+
 async def scan(seconds: float, show_all: bool) -> int:
     """List nearby ble-ssh servers (or, with --all, every named BLE device) by signal strength."""
-    found = await BleakScanner.discover(timeout=seconds, return_adv=True)
-    rows = []
-    for device, adv in found.values():
-        is_ble_ssh = SERVICE_UUID in (u.lower() for u in adv.service_uuids)
-        name = adv.local_name or device.name
-        if is_ble_ssh or (show_all and name):
-            rows.append((adv.rssi, name or "?", device.address, is_ble_ssh))
-    rows.sort(reverse=True)
-
+    rows = await scan_devices(seconds, show_all)
     if not rows:
         print(f"No ble-ssh servers found in {seconds:g} s." if not show_all else f"No named devices found in {seconds:g} s.")
         if not show_all:
@@ -304,11 +354,14 @@ def client_command() -> str:
     return f'"{exe}"' if " " in exe else exe
 
 
-def ssh_config(target: str, user: Optional[str], alias: Optional[str]) -> int:
-    """Print a ~/.ssh/config block that reaches TARGET over BLE."""
-    if alias is None:
-        base = re.sub(r"^ssh-", "", target) if not is_address(target) else target.replace(":", "").lower()
-        alias = re.sub(r"[^A-Za-z0-9._-]", "-", base) + "-ble"
+def default_alias(target: str) -> str:
+    base = re.sub(r"^ssh-", "", target) if not is_address(target) else target.replace(":", "").lower()
+    return re.sub(r"[^A-Za-z0-9._-]", "-", base) + "-ble"
+
+
+def ssh_config_block(target: str, user: Optional[str], alias: Optional[str]) -> str:
+    """A ~/.ssh/config block (Host ALIAS) that reaches TARGET over BLE."""
+    alias = alias or default_alias(target)
     lines = [
         f"Host {alias}",
         f"    HostName {target}",
@@ -316,12 +369,18 @@ def ssh_config(target: str, user: Optional[str], alias: Optional[str]) -> int:
     if user:
         lines.append(f"    User {user}")
     lines += [
-        f"    ProxyCommand {client_command()} {target}",
+        f"    ProxyCommand {client_command()} --progress {target}",
         "    # BLE is slow to (re)connect; notice a dead link instead of hanging",
         "    ServerAliveInterval 15",
         "    ServerAliveCountMax 3",
     ]
-    print("\n".join(lines))
+    return "\n".join(lines)
+
+
+def ssh_config(target: str, user: Optional[str], alias: Optional[str]) -> int:
+    """Print a ~/.ssh/config block that reaches TARGET over BLE."""
+    alias = alias or default_alias(target)
+    print(ssh_config_block(target, user, alias))
     again = f"ble-ssh-client --ssh-config {target}{' --user ' + user if user else ''}"
     if sys.platform == "win32":
         # Windows PowerShell's ">>" writes UTF-16, which ssh can't read.
@@ -352,7 +411,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("-p", "--pair", action="store_true",
                         help="bond with the server first (needed once for servers started with --require-bonding)")
     parser.add_argument("-r", "--reliable", action="store_true", help="use write-with-response (slower)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="print progress to stderr")
+    parser.add_argument("-v", "--verbose", action="store_true", help="print detailed, timestamped progress to stderr")
+    parser.add_argument("--progress", action="store_true",
+                        help="print a short status line per step (looking, connecting, connected) to stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
     if args.timeout is None:
@@ -395,10 +456,11 @@ def run_detached_worker(argv: list) -> int:
 
 
 def main(argv: Optional[list] = None) -> int:
-    global verbose
+    global verbose, show_progress
     argv = sys.argv[1:] if argv is None else argv
     args = parse_args(argv)
     verbose = args.verbose
+    show_progress = args.progress
     if args.ssh_config:
         return ssh_config(args.target, args.user, args.alias)
     if args.scan:  # interactive use, not a ProxyCommand: no worker process or binary stdio

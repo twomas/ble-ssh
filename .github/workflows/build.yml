@@ -91,5 +91,5 @@ jobs:
         run: |
           ble-ssh-client --version
           ble-ssh-client --help
-          python -c "import ble_ssh_client.cli"
+          python -c "import ble_ssh_client.cli, ble_ssh_client.gui"
           ble-ssh-client --ssh-config AA:BB:CC:DD:EE:FF --user pi | grep -q "ProxyCommand .*ble-ssh-client.* AA:BB:CC:DD:EE:FF"
