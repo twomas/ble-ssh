@@ -27,9 +27,35 @@ which ssh can't read.
 ble-ssh-client --ssh-config ssh-server --user pi | Add-Content -Encoding ascii $HOME\.ssh\config
 ```
 
-Or use the small GUI: `ble-ssh-gui` lists servers, opens an ssh session in a new terminal
-window, saves the alias to `~/.ssh/config` and remembers the login user per server. It needs
-tkinter, which ships with Python on Windows and macOS; on Debian/Ubuntu install `python3-tk`.
+## GUI
+
+`ble-ssh-gui` is installed with the client: a small window to find a server and log in,
+without typing addresses or `ProxyCommand`s.
+
+![ble-ssh-gui](../../docs/ble-ssh-gui.png)
+
+```bash
+ble-ssh-gui
+```
+
+- **Scan** lists ble-ssh servers live as they are heard (20 s; the button turns into **Stop**).
+  Tick **All named devices** to see every named BLE device: a server started with
+  `--no-advertise` runs behind another program's advertisement, and is reached by the address
+  of that device.
+- **Connect** (or double-click a row) opens ssh in a new terminal window, with this client as
+  `ProxyCommand` and `--progress`, so the window says what is happening while BLE connects.
+  The window stays open after ssh exits, so errors can be read.
+- **Add to ~/.ssh/config** saves the server as an ssh alias (it shows the block first and
+  refuses an alias that already exists); after that, plain `ssh <alias>` works from any
+  terminal. **Copy ssh command** puts the full command on the clipboard.
+- The login user is remembered per server. Left empty, ssh uses your local user name, which
+  is rarely the right one on the server.
+
+Terminals: `cmd` on Windows, Terminal.app on macOS, and on Linux the desktop's
+`x-terminal-emulator`, or ptyxis, gnome-terminal, kgx, konsole, xfce4-terminal or xterm.
+tkinter ships with Python on Windows and macOS; on Debian/Ubuntu install `python3-tk`.
+
+## Options
 
 | Option | |
 |--------|-|
@@ -44,7 +70,7 @@ tkinter, which ships with Python on Windows and macOS; on Debian/Ubuntu install 
 | `--progress` | One status line per step on stderr (looking, connecting, connected); `--ssh-config` and the GUI turn it on |
 | `-v, --verbose` | Detailed progress on stderr, with timestamps |
 
-Platform notes:
+## Platform notes
 
 - **Windows:** works with Windows' own OpenSSH (`ssh.exe`). Use the full path to
   `ble-ssh-client.exe` in `ProxyCommand` if it isn't on `PATH`.
