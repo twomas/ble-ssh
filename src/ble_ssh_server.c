@@ -128,7 +128,9 @@ static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer us
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         session->read_watch = 0;
-        session_close(session, n == 0 ? "backend closed" : g_strerror(errno), TRUE);
+        // Keep the link: SSH ends the session in-band, and the client may reuse the link for
+        // its next connection (Windows does); dropping it here would kill that one.
+        session_close(session, n == 0 ? "backend closed" : g_strerror(errno), FALSE);
         return G_SOURCE_REMOVE;
     }
     session->bytes_in += (guint64) n;
@@ -177,7 +179,7 @@ static void session_flush_tx(Session *session) {
             session->mtu = BLE_SSH_MIN_CHUNK + BLE_SSH_ATT_OVERHEAD;
             continue;
         }
-        session_close(session, g_strerror(result), TRUE);
+        session_close(session, g_strerror(result), FALSE);
         return;
     }
     session_resume_reading(session);
@@ -188,21 +190,30 @@ static Session *session_open(const char *address, guint16 mtu) {
         msg("%s: rejected, %d clients already connected", address, opt_max_clients);
         return NULL;
     }
-    const int fd = connect_backend();
-    if (fd < 0) {
-        msg("%s: cannot connect to %s:%d: %s", address, opt_host, opt_port, g_strerror(errno));
-        return NULL;
-    }
+    // The TCP connection to sshd is made on the client's first write, not here: a client may
+    // subscribe briefly without sending anything (ours toggle on -> off -> on to get a clean
+    // session on a reused link), and sshd's banner from such a throwaway session would land
+    // in the next one. SSH clients always send their banner right away, so nothing is lost.
     Session *session = g_new0(Session, 1);
     session->address = g_ascii_strup(address, -1);
-    session->fd = fd;
+    session->fd = -1;
     session->mtu = mtu;
     session->tx = g_byte_array_new();
     g_hash_table_insert(sessions, session->address, session);
-    session_resume_reading(session);
     msg("%s: session opened (mtu %u, %u active)", session->address, mtu, g_hash_table_size(sessions));
     notify_status();
     return session;
+}
+
+static gboolean session_connect_backend(Session *session) {
+    if (session->fd >= 0) return TRUE;
+    session->fd = connect_backend();
+    if (session->fd < 0) {
+        msg("%s: cannot connect to %s:%d: %s", session->address, opt_host, opt_port, g_strerror(errno));
+        return FALSE;
+    }
+    session_resume_reading(session);
+    return TRUE;
 }
 
 static void session_close(Session *session, const char *reason, gboolean disconnect_central) {
@@ -324,12 +335,17 @@ static const char *on_char_write(const Application *application, const char *add
     if (!g_str_equal(char_uuid, BLE_SSH_RX_UUID)) return BLUEZ_ERROR_REJECTED;
     Session *session = session_lookup(address);
     if (session == NULL) {
-        // Clients must subscribe to TX first; that is what opens the session.
+        // A session is exactly one TX subscription (notifications on -> off). Never start one
+        // from a write: those bytes are the middle of some other SSH stream.
         return BLUEZ_ERROR_NOT_PERMITTED;
     }
     if (mtu > session->mtu) session->mtu = mtu;
+    if (!session_connect_backend(session)) {
+        session_close(session, "backend unavailable", FALSE);
+        return BLUEZ_ERROR_FAILED;
+    }
     if (!write_all(session->fd, byteArray->data, byteArray->len)) {
-        session_close(session, g_strerror(errno), TRUE);
+        session_close(session, g_strerror(errno), FALSE);
         return BLUEZ_ERROR_FAILED;
     }
     return NULL;

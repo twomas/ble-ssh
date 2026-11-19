@@ -41,6 +41,7 @@ static Adapter *adapter = NULL;
 static Agent *agent = NULL;
 static gboolean pairing_started = FALSE;
 static gboolean reconnecting = FALSE; // after a fresh pairing, until the second link is up
+static gboolean giving_up = FALSE;    // a definite failure: don't retry on the disconnect it causes
 static guint reconnect_source = 0;
 static guint timeout_source = 0;
 static Device *device = NULL;
@@ -101,6 +102,8 @@ static void pump_writes(void) {
     if (outq->len == 0) {
         if (stdin_eof) {
             debug("stdin closed, disconnecting");
+            // Unsubscribing is what ends the session on the server, even if the link lingers.
+            binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
             binc_device_disconnect(device);
         }
         return;
@@ -191,6 +194,7 @@ static void on_services_resolved(Device *d) {
     if (!binc_device_has_service(device, BLE_SSH_SERVICE_UUID)) {
         msg("%s does not offer the ble-ssh service (is ble_ssh_server running there?)",
             binc_device_get_address(device));
+        giving_up = TRUE;
         binc_device_disconnect(device);
         return;
     }
@@ -208,6 +212,7 @@ static void on_services_resolved(Device *d) {
 static void on_bonding_state_changed(Device *d, BondingState new_state, BondingState old_state, const GError *error) {
     if (error != NULL) {
         msg("pairing failed: %s (is the server pairable?)", error->message);
+        giving_up = TRUE;
         binc_device_disconnect(device);
         return;
     }
@@ -236,8 +241,10 @@ static guint32 on_request_passkey(Device *d) {
 
 static void on_connection_state(Device *d, ConnectionState state, const GError *error) {
     if (error != NULL) {
-        if (reconnecting) {
-            debug("reconnect attempt failed (%s), retrying", error->message);
+        if (!tunnel_up) {
+            // Errors like le-connection-abort-by-local are transient (the previous link is
+            // still being torn down, or the radio was busy); keep trying until --timeout.
+            debug("connect attempt failed (%s), retrying", error->message);
             schedule_reconnect();
             return;
         }
@@ -249,6 +256,13 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
     if (reconnecting) {
         if (state == BINC_CONNECTED) reconnecting = FALSE;
         else if (state == BINC_DISCONNECTED) schedule_reconnect();
+        return;
+    }
+    if (state == BINC_DISCONNECTED && !tunnel_up && !giving_up && !stdin_eof) {
+        // Dropped before the tunnel came up: usually the previous client's link still being
+        // torn down. Try again until --timeout.
+        debug("link dropped before the tunnel was up, retrying");
+        schedule_reconnect();
         return;
     }
     if (state == BINC_DISCONNECTED) quit(tunnel_up ? 0 : 255);
@@ -321,6 +335,7 @@ static gboolean on_timeout(gpointer data) {
 }
 
 static gboolean on_terminate(gpointer data) {
+    if (device != NULL && tunnel_up) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
     if (device != NULL) binc_device_disconnect(device);
     quit(tunnel_up ? 0 : 255);
     return G_SOURCE_REMOVE;
