@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-BLE_SSH_VERSION = v0.1.0
+BLE_SSH_VERSION = v0.1.1
 BLE_SSH_SITE = https://github.com/twomas/ble-ssh.git
 BLE_SSH_SITE_METHOD = git
 BLE_SSH_GIT_SUBMODULES = YES
