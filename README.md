@@ -160,6 +160,24 @@ sudoedit /etc/bluetooth/main.conf
 sudo systemctl restart bluetooth        # ble-ssh-server restarts with it (PartOf=)
 ```
 
+#### Desktop Linux servers: BLE-MIDI
+
+On a desktop install (Raspberry Pi OS with desktop, Ubuntu desktop) WirePlumber exposes a
+BLE-MIDI GATT service whose characteristic requires encryption. Clients that connect then
+try to pair for it, and without a pairing agent they drop the link before the tunnel comes
+up. Unless you use BLE-MIDI, disable it for the desktop user:
+
+```bash
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cat > ~/.config/wireplumber/wireplumber.conf.d/90-disable-ble-midi.conf <<'EOF'
+wireplumber.profiles = { main = { monitor.bluez-midi = disabled } }
+EOF
+systemctl --user restart wireplumber
+bluetoothctl show | grep 03b80e5a      # no output = the MIDI service is gone
+```
+
+Headless and buildroot systems don't run WirePlumber and aren't affected.
+
 ### Troubleshooting
 
 | Symptom | Likely cause |
@@ -170,7 +188,7 @@ sudo systemctl restart bluetooth        # ble-ssh-server restarts with it (PartO
 | The server doesn't show up in a scan | Adapter is powered off (`bluetoothctl show`), or the service isn't running (`systemctl status ble-ssh-server`) |
 | `session opened` is logged but ssh hangs | sshd isn't listening on the configured `--host`/`--port` |
 | Server logs `rejected, not bonded` | The client isn't bonded, or this was the first link right after pairing. Connect again, or use `ble_ssh_client --pair` |
-| Client: `CONNECTED`, then `DISCONNECTED`; the client's bluetoothd logs `No agent available` | Something on the server needs encryption (e.g. PipeWire's BLE-MIDI service on a desktop Linux, or a stale bond on one side only), and the client has no pairing agent. Use `--pair`, or remove the stale bond on both sides |
+| Client: `CONNECTED`, then `DISCONNECTED`; the client's bluetoothd logs `No agent available` | Something on the server needs encryption, and the client has no pairing agent. On a desktop Linux server this is usually WirePlumber's BLE-MIDI service: disable it with `monitor.bluez-midi = disabled` (see below). A stale bond on one side only does the same; remove it on both sides |
 
 ### Notes
 
@@ -208,8 +226,28 @@ add `BLE_SSH_OVERRIDE_SRCDIR = /path/to/ble-ssh` to `local.mk` in your output di
 
 ## Client
 
-The client runs on another Linux machine with BlueZ (one adapter cannot connect to itself).
-Use it as an ssh `ProxyCommand`, with the server's Bluetooth address or advertised name:
+There are two clients with the same command line:
+
+| | `ble_ssh_client` (C) | `ble-ssh-client` (Python) |
+|---|---|---|
+| Platforms | Linux (BlueZ) | Windows, macOS, Linux |
+| Dependencies | none at runtime | Python 3.9+, [bleak](https://github.com/hbldh/bleak) |
+| Install | built with the server | `pipx install ./clients/python` |
+| Use it for | embedded and headless Linux | developer laptops |
+
+The Python client is documented in [clients/python](clients/python/README.md). It can also
+find servers and write the ssh alias for you, and from Windows it works with the built-in
+OpenSSH:
+
+```powershell
+ble-ssh-client --scan
+ble-ssh-client --ssh-config ssh-server --user pi | Add-Content -Encoding ascii $HOME\.ssh\config
+ssh server-ble
+```
+
+The client must run on another machine than the server (one adapter cannot connect to
+itself). Use it as an ssh `ProxyCommand`, with the server's Bluetooth address or advertised
+name:
 
 ```bash
 ssh -o ProxyCommand="ble_ssh_client AA:BB:CC:DD:EE:FF" pi@raspberrypi
@@ -233,7 +271,30 @@ Just Works pairing is supported.
 ## Performance
 
 Expect roughly 10–50 kB/s depending on MTU, PHY and connection interval: fine for a shell,
-slow for large `scp` transfers.
+slow for large `scp` transfers. Measured from Windows (Python client) to a Raspberry Pi 5:
+256 KiB in 14 s including connection setup, about 20 kB/s.
+
+## Sessions and link reuse
+
+A session is exactly one subscription to TX: it starts when the client enables
+notifications and ends when it disables them or disconnects. The server connects to sshd on
+the client's first write.
+
+Ending a session cleanly matters because the BLE link can outlive the client:
+
+- **ssh kills its ProxyCommand** when the session ends: SIGHUP on Linux and macOS,
+  `TerminateProcess` on Windows. Both clients catch SIGHUP and then unsubscribe and
+  disconnect. `TerminateProcess` can't be caught, so on Windows the Python client runs the
+  BLE work in a detached child process that outlives the one ssh kills.
+- **Windows keeps the link up** for a few seconds after a disconnect and reuses it for the
+  next connection. The Python client therefore toggles notifications off and on when it
+  starts, so a leftover subscription can't swallow the new session.
+- **Right after a previous connection**, the next attempt can hit the old link while it is
+  still going away (`le-connection-abort-by-local`, `Not Connected`, or Windows' "the object
+  has been closed"). Both clients retry until `--timeout`.
+
+Tested with 14 connections in a row from Linux (both clients, alternating) and 5 in a row
+from Windows, with no pause between them.
 
 ## Protocol
 

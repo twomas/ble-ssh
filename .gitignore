@@ -1,1 +1,5 @@
 build/
+__pycache__/
+*.pyc
+*.egg-info/
+clients/python/build/
