@@ -302,15 +302,21 @@ static gboolean is_bt_address(const char *s) {
 }
 
 static void start(void) {
-    Device *known = binc_adapter_get_device_by_address(adapter, target);
-    if (known != NULL) {
-        connect_to(known);
-        return;
+    const gboolean by_address = is_bt_address(target);
+    if (by_address) {
+        // binc looks devices up by address only (and asserts on anything else); BlueZ's
+        // addresses are upper case.
+        gchar *address = g_ascii_strup(target, -1);
+        Device *known = binc_adapter_get_device_by_address(adapter, address);
+        g_free(address);
+        if (known != NULL) {
+            connect_to(known);
+            return;
+        }
     }
     // A server started with --no-advertise is reached through another program's advertisement,
     // which doesn't list our service UUID. So when we know the address, scan unfiltered; a name
     // can only match our own advertisement, so filter on the UUID then.
-    const gboolean by_address = is_bt_address(target);
     debug("scanning for %s%s", target, by_address ? "" : " (ble-ssh advertisers only)");
     GPtrArray *uuids = g_ptr_array_new();
     if (!by_address) g_ptr_array_add(uuids, BLE_SSH_SERVICE_UUID);
