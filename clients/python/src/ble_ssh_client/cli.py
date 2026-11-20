@@ -63,6 +63,48 @@ def is_address(target: str) -> bool:
     return bool(MAC_RE.match(target) or UUID_RE.match(target))
 
 
+async def link_in_use(target: str) -> Optional[str]:
+    """The address of a device matching TARGET whose link another client on this machine is
+    using (connected, TX notifying), or None. BlueZ has one link per device and the server one
+    session per link, so a second client would end that session and mix its bytes into it.
+
+    Linux only: BlueZ shows every client's links and subscriptions on D-Bus. Elsewhere, and if
+    the check itself fails, assume the link is free.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        from dbus_fast import BusType, Message
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return None
+    bus = None
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        reply = await bus.call(Message(destination="org.bluez", path="/", member="GetManagedObjects",
+                                       interface="org.freedesktop.DBus.ObjectManager"))
+        objects = reply.body[0] if reply.body else {}
+        value = lambda props, key: props[key].value if key in props else None  # noqa: E731
+        for path, interfaces in objects.items():
+            device = interfaces.get("org.bluez.Device1")
+            if not device or not value(device, "Connected"):
+                continue
+            names = (value(device, "Address") or "").upper(), value(device, "Name"), value(device, "Alias")
+            if target.upper() != names[0] and target not in names[1:]:
+                continue
+            for char_path, char_interfaces in objects.items():
+                char = char_interfaces.get("org.bluez.GattCharacteristic1")
+                if (char and char_path.startswith(path + "/") and (value(char, "UUID") or "").lower() == TX_UUID
+                        and value(char, "Notifying")):
+                    return names[0]
+    except Exception as error:  # D-Bus unavailable, no BlueZ, ...: don't block the connection on it
+        debug(f"could not check whether the link is in use ({error})")
+    finally:
+        if bus is not None:
+            bus.disconnect()
+    return None
+
+
 async def find_device(target: str, timeout: float) -> Optional[BLEDevice]:
     # Unfiltered, by address or by name: a server started with --no-advertise is reached
     # through another program's advertisement, which carries that program's name and not our
@@ -164,6 +206,11 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
         # A failed earlier attempt may report its disconnect late; only the current one counts.
         if which is active[0]:
             disconnected.set()
+
+    in_use = await link_in_use(args.target)
+    if in_use is not None:
+        log(f"the link to {in_use} is in use by another client on this machine")
+        return None
 
     attempt = 0
     while (remaining := deadline - loop.time()) > 0:

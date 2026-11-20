@@ -301,8 +301,9 @@ sftp pi-ble
 
 **One BLE link per device.** A client machine has a single BLE link to a server, and the
 server runs one session per link. Start a second client for the same device while one is
-connected and the C client refuses with "in use"; the Python client doesn't check yet: it
-ends the session that is running and doesn't get one either. To run several sessions at once
+connected and it refuses with "the link to … is in use by another client on this machine",
+instead of ending the session that is running. (On Linux; Windows and macOS don't show other
+programs' links, so there the Python client can't check.) To run several sessions at once
 (a shell, a copy, an editor), let ssh share one connection:
 
 ```
