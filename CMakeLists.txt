@@ -17,6 +17,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0 gio-unix-2.0)
 include_directories(${GLIB_INCLUDE_DIRS})
 
+# Use only the GLib API of this version (GLIB_VERSION_<major>_<minor>), for bluez_inc too. Newer
+# GLib headers otherwise swap in newer functions (g_string_free() becomes
+# g_string_free_and_steal() from 2.76), and a binary built on a new distribution would not
+# start on a device with an older GLib. Using a newer function is then a compile warning.
+set(BLE_SSH_GLIB_API "2_58" CACHE STRING "Oldest GLib API used, as <major>_<minor>")
+add_compile_definitions(GLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_${BLE_SSH_GLIB_API}
+                        GLIB_VERSION_MAX_ALLOWED=GLIB_VERSION_${BLE_SSH_GLIB_API})
+
 # Only the bluez_inc library, not its examples/tests. EXCLUDE_FROM_ALL keeps its headers and
 # static library out of `cmake --install`; it is still built because our targets link to it.
 add_subdirectory(external/bluez_inc/binc EXCLUDE_FROM_ALL)

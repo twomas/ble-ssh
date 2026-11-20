@@ -31,7 +31,9 @@ sshd sees the session coming from `127.0.0.1`: the bytes arrived over BLE, not t
 
 ## Build
 
-Requires Linux with BlueZ 5.x, CMake >= 3.16 and GLib/GIO headers.
+Requires Linux with BlueZ 5.x, CMake >= 3.16 and GLib/GIO headers (GLib 2.58 or newer).
+The code only uses the GLib 2.58 API, so a binary built on a new distribution also runs on a
+device with an older GLib.
 
 ```bash
 sudo apt install build-essential cmake pkg-config libglib2.0-dev

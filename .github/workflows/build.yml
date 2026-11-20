@@ -12,11 +12,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The artifacts come from the oldest runners (glibc 2.35), so the binaries also run
+          # on older targets; the GLib API is capped in CMakeLists.txt (BLE_SSH_GLIB_API).
+          - os: ubuntu-22.04
+            arch: x86_64
+            artifact: true
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            artifact: true
+          # The newest runners check that the code still builds cleanly with new compilers.
           - os: ubuntu-latest
             arch: x86_64
+            artifact: false
           - os: ubuntu-24.04-arm
             arch: arm64
+            artifact: false
     runs-on: ${{ matrix.os }}
+    env:
+      MAX_GLIBC: "2.35"
 
     steps:
       - name: Check out code
@@ -34,31 +47,46 @@ jobs:
           cmake -B ${{github.workspace}}/build -S .
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_FLAGS="-Werror"
-          -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/install
+          -DCMAKE_INSTALL_PREFIX=/usr
 
       - name: Build Project
         run: cmake --build ${{github.workspace}}/build -- -j$(nproc)
 
       - name: Install Project
-        run: cmake --install ${{github.workspace}}/build
+        # Staged with DESTDIR, so the artifact is a /usr tree that can be copied onto a target.
+        run: DESTDIR=${{github.workspace}}/install cmake --install ${{github.workspace}}/build
 
       - name: Test Installation
         run: |
           set -e
           install=${{github.workspace}}/install
           ls -lR "$install"
-          test -x "$install/bin/ble_ssh_server"
-          test -x "$install/bin/ble_ssh_client"
-          unit="$install/lib/systemd/system/ble-ssh-server.service"
+          test -x "$install/usr/bin/ble_ssh_server"
+          test -x "$install/usr/bin/ble_ssh_client"
+          unit="$install/usr/lib/systemd/system/ble-ssh-server.service"
           test -f "$unit"
-          test -f "$install/lib/sysusers.d/ble-ssh.conf"
-          grep -qx "ExecStart=$install/bin/ble_ssh_server \$BLE_SSH_OPTS" "$unit"
+          test -f "$install/usr/lib/sysusers.d/ble-ssh.conf"
+          grep -qx "ExecStart=/usr/bin/ble_ssh_server \$BLE_SSH_OPTS" "$unit"
           grep -qx "Type=notify" "$unit"
-          "$install/bin/ble_ssh_server" --help > /dev/null
-          "$install/bin/ble_ssh_client" --help > /dev/null
+          "$install/usr/bin/ble_ssh_server" --help > /dev/null
+          "$install/usr/bin/ble_ssh_client" --help > /dev/null
           echo "Installation test passed."
 
+      - name: Check portability
+        if: matrix.artifact
+        run: |
+          set -e
+          for bin in ${{github.workspace}}/install/usr/bin/ble_ssh_*; do
+            need=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "$(basename "$bin"): needs glibc $need"
+            if [ "$(printf '%s\n%s\n' "$need" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+              echo "::error::$(basename "$bin") needs glibc $need, newer than $MAX_GLIBC"
+              exit 1
+            fi
+          done
+
       - name: Upload Build Artifacts
+        if: matrix.artifact
         uses: actions/upload-artifact@v7
         with:
           name: ble-ssh-${{ matrix.arch }}

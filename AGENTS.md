@@ -28,7 +28,10 @@ python -c "import ble_ssh_client.cli, ble_ssh_client.gui"
 ```
 
 CI ([.github/workflows/build.yml](.github/workflows/build.yml)) builds the C code on x86_64
-and arm64 and installs it. It smoke-tests the Python client on Linux, Windows and macOS with the
+and arm64, on the newest Ubuntu and on Ubuntu 22.04. The 22.04 builds are the artifacts (a
+`/usr` tree): they must need no newer glibc than 2.35, and CMake caps the GLib API at
+`BLE_SSH_GLIB_API` (2.58), so they also run on older targets. Raising either is a decision,
+not a fix for a build error. It smoke-tests the Python client on Linux, Windows and macOS with the
 oldest and newest supported Python (3.10 and 3.14). The runners have no Bluetooth, so
 anything that touches BLE has to be tested on real hardware (see below).
 
