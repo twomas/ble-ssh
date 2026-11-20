@@ -64,17 +64,14 @@ def is_address(target: str) -> bool:
 
 
 async def find_device(target: str, timeout: float) -> Optional[BLEDevice]:
+    # Unfiltered, by address or by name: a server started with --no-advertise is reached
+    # through another program's advertisement, which carries that program's name and not our
+    # service UUID. Whether the device runs ble-ssh is checked once connected (NoService).
+    debug(f"scanning for {target}")
     if is_address(target):
-        # Unfiltered, so servers started with --no-advertise (reached through another
-        # program's advertisement) are found too.
-        debug(f"scanning for {target}")
         return await BleakScanner.find_device_by_address(target, timeout=timeout)
-    debug(f"scanning for {target} (ble-ssh advertisers only)")
     return await BleakScanner.find_device_by_filter(
-        lambda device, adv: target in (device.name, adv.local_name) and SERVICE_UUID in adv.service_uuids,
-        timeout=timeout,
-        service_uuids=[SERVICE_UUID],
-    )
+        lambda device, adv: target in (device.name, adv.local_name), timeout=timeout)
 
 
 def write_stdout(data: bytes) -> None:
@@ -215,7 +212,8 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
         log("Windows kept closing the connection. Another program using Bluetooth at the same time "
             "(a scan, or another connection to this device) is the usual cause; close it and try again.")
     elif last_error is None:
-        log("is the server in range and running? Servers started with --no-advertise must be reached by address.")
+        log("is the server in range and running? A server started with --no-advertise goes by the name "
+            "(or address) of the program that advertises.")
     return None
 
 
@@ -306,17 +304,25 @@ def merge_advertisement(seen: dict, device: BLEDevice, adv) -> None:
 
     Many devices alternate between packets with and without their name or service list (for
     example when they multiplex several advertisements), so keeping only the last packet
-    would drop them at random.
+    would drop them at random. A ble-ssh server next to the device's own advertising shows
+    up under both names, so keep every name seen.
     """
-    entry = seen.setdefault(device.address, {"name": None, "ble_ssh": False, "rssi": adv.rssi})
-    entry["name"] = adv.local_name or device.name or entry["name"]
+    entry = seen.setdefault(device.address, {"names": [], "ble_ssh": False, "rssi": adv.rssi})
+    name = adv.local_name or device.name
+    if name and name not in entry["names"]:
+        entry["names"].append(name)
     entry["ble_ssh"] = entry["ble_ssh"] or SERVICE_UUID in (u.lower() for u in adv.service_uuids)
     entry["rssi"] = adv.rssi
 
 
+NAME_SEPARATOR = " / "
+
+
 def scan_rows(seen: dict, show_all: bool) -> list:
-    rows = [(e["rssi"], e["name"] or "?", address, e["ble_ssh"]) for address, e in list(seen.items())
-            if e["ble_ssh"] or (show_all and e["name"])]
+    """(rssi, name, address, is_ble_ssh) rows; a device seen under several names lists them all,
+    joined with NAME_SEPARATOR."""
+    rows = [(e["rssi"], NAME_SEPARATOR.join(e["names"]) or "?", address, e["ble_ssh"])
+            for address, e in list(seen.items()) if e["ble_ssh"] or (show_all and e["names"])]
     rows.sort(reverse=True)
     return rows
 
@@ -327,7 +333,8 @@ async def scan(seconds: float, show_all: bool) -> int:
     if not rows:
         print(f"No ble-ssh servers found in {seconds:g} s." if not show_all else f"No named devices found in {seconds:g} s.")
         if not show_all:
-            print("Servers started with --no-advertise don't show up here; try --scan --all and connect by address.")
+            print("Servers started with --no-advertise don't show up here; try --scan --all and connect by "
+                  "that device's name or address.")
         return 1
     width = max(len(r[1]) for r in rows)
     print(f"{'NAME':<{width}}  {'ADDRESS':<17}  RSSI" + ("  BLE-SSH" if show_all else ""))
@@ -336,7 +343,7 @@ async def scan(seconds: float, show_all: bool) -> int:
         print(f"{name:<{width}}  {address:<17}  {rssi:>4}{marker}")
     if show_all:
         print("\nBLE-SSH = advertises the ble-ssh service. A server started with --no-advertise runs behind\n"
-              "another program's advertisement: connect to it by address.")
+              "another program's advertisement: connect to it by that device's name or address.")
     return 0
 
 

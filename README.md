@@ -66,9 +66,11 @@ for example), run ble-ssh with `--no-advertise`:
 
 BlueZ shares one GATT database between all applications on an adapter. A central that
 connects through the other program's advertisement therefore sees both services, and the
-two programs don't interfere with each other. Clients then have to connect by Bluetooth
-address (`ble_ssh_client AA:BB:CC:DD:EE:FF`): the advertised name and service UUID belong
-to the other program, so lookup by name won't find the server.
+two programs don't interfere with each other. Clients then connect by the name the other
+program advertises, or by Bluetooth address (`ble_ssh_client AA:BB:CC:DD:EE:FF`). Both
+clients look names up in any advertisement and check for the ble-ssh service once
+connected, so a device with that name that doesn't run ble-ssh fails with "does not offer
+the ble-ssh service".
 
 ble-ssh never changes adapter-wide settings: pairable, discoverable, the pairing agent and
 the alias are all left to the other program. The only exception is power: by default the

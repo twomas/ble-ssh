@@ -28,7 +28,7 @@ except ImportError:  # e.g. Debian/Ubuntu without python3-tk
 from . import __version__
 from bleak import BleakScanner
 
-from .cli import client_command, default_alias, merge_advertisement, scan_rows, ssh_config_block
+from .cli import NAME_SEPARATOR, client_command, default_alias, merge_advertisement, scan_rows, ssh_config_block
 
 SCAN_SECONDS = 20.0
 SSH_CONFIG = os.path.join(os.path.expanduser("~"), ".ssh", "config")
@@ -273,9 +273,14 @@ class App:
         if not selection or selection[0] not in self.rows:
             return
         _, name, address, is_ble_ssh = self.rows[selection[0]]
-        # Advertised names are what the name filter matches; anything else is reached by address.
+        # Connect by name when the device goes by one name: the client finds any device by its
+        # advertised name (also a server behind another program's advertisement) and checks for
+        # the ble-ssh service once connected. A device seen under several names (a server next
+        # to the device's own advertising) is reached by address: the client takes the first
+        # device with the name it is given, and BlueZ reports either name for that device.
         # macOS hides addresses, but its device UUIDs work the same way.
-        target = name if is_ble_ssh and name != "?" and sys.platform != "darwin" else address
+        single_name = name != "?" and NAME_SEPARATOR not in name
+        target = name if single_name and sys.platform != "darwin" else address
         if self.target.get() != target:
             self.target.set(target)
 

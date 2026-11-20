@@ -422,12 +422,11 @@ static void start(void) {
             return;
         }
     }
-    // A server started with --no-advertise is reached through another program's advertisement,
-    // which doesn't list our service UUID. So when we know the address, scan unfiltered; a name
-    // can only match our own advertisement, so filter on the UUID then.
-    debug("scanning for %s%s", target, by_address ? "" : " (ble-ssh advertisers only)");
+    // Unfiltered, by address or by name: a server started with --no-advertise is reached through
+    // another program's advertisement, which carries that program's name and not our service
+    // UUID. Whether the device runs ble-ssh is checked once its services are resolved.
+    debug("scanning for %s", target);
     GPtrArray *uuids = g_ptr_array_new();
-    if (!by_address) g_ptr_array_add(uuids, BLE_SSH_SERVICE_UUID);
     binc_adapter_set_discovery_cb(adapter, &on_scan_result);
     binc_adapter_set_discovery_filter(adapter, -100, uuids, NULL);
     g_ptr_array_free(uuids, TRUE);

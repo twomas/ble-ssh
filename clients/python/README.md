@@ -40,8 +40,9 @@ ble-ssh-gui
 
 - **Scan** lists ble-ssh servers live as they are heard (20 s; the button turns into **Stop**).
   Tick **All named devices** to see every named BLE device: a server started with
-  `--no-advertise` runs behind another program's advertisement, and is reached by the address
-  of that device.
+  `--no-advertise` runs behind another program's advertisement, and goes by that device's
+  name. A device heard under several names (a server next to the device's own advertising)
+  lists them all, as `ssh-server / Gadget-1234`, and is connected by address.
 - **Connect** (or double-click a row) opens ssh in a new terminal window, with this client as
   `ProxyCommand` and `--progress`, so the window says what is happening while BLE connects.
   The window stays open after ssh exits, so errors can be read.
@@ -59,9 +60,9 @@ tkinter ships with Python on Windows and macOS; on Debian/Ubuntu install `python
 
 | Option | |
 |--------|-|
-| `ADDRESS\|NAME` | Bluetooth address, or the server's advertised name (`ssh-<hostname>`) |
+| `ADDRESS\|NAME` | Bluetooth address, or the server's advertised name (`ssh-<hostname>`, or with `--no-advertise` the name of the program that advertises) |
 | `-s, --scan` | List nearby ble-ssh servers by signal strength and exit (scans 5 s, or `--timeout`) |
-| `-a, --all` | With `--scan`: list every named BLE device and mark the ble-ssh ones. A server started with `--no-advertise` hides behind another program's advertisement: find its address here |
+| `-a, --all` | With `--scan`: list every named BLE device and mark the ble-ssh ones. A server started with `--no-advertise` hides behind another program's advertisement: find its name or address here |
 | `--ssh-config` | Print a `~/.ssh/config` block (`Host <name>-ble`) for `ADDRESS\|NAME`, with this client's full path as `ProxyCommand` |
 | `--user U`, `--alias A` | With `--ssh-config`: login user and `Host` alias |
 | `-p, --pair` | Bond first, then reconnect (once, for servers with `--require-bonding`) |
