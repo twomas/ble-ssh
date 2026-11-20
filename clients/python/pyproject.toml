@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ble-ssh-client"
-version = "0.1.1"
+version = "0.1.2"
 description = "SSH over Bluetooth LE: ssh ProxyCommand client for ble_ssh_server (Windows, macOS, Linux)"
 readme = "README.md"
 license = { text = "MIT" }
