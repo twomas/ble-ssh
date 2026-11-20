@@ -287,11 +287,58 @@ Options: `--timeout S` (default 20), `--pair` (bond first, needed once for serve
 stderr). `--pair` registers a NoInputNoOutput agent for the duration of the run, so only
 Just Works pairing is supported.
 
+### Files, editors and other tools
+
+The tunnel carries a normal SSH connection, so everything that uses ssh works over it:
+terminal programs such as `vi`, port forwards, and file transfer. Tools that read
+`~/.ssh/config` only need the alias:
+
+```bash
+scp notes.txt pi-ble:/tmp/
+rsync -av ./site/ pi-ble:/var/www/site/
+sftp pi-ble
+```
+
+**One BLE link per device.** A client machine has a single BLE link to a server, and the
+server runs one session per link. Start a second client for the same device while one is
+connected and the C client refuses with "in use"; the Python client doesn't check yet: it
+ends the session that is running and doesn't get one either. To run several sessions at once
+(a shell, a copy, an editor), let ssh share one connection:
+
+```
+Host pi-ble
+    HostName raspberrypi
+    User pi
+    ProxyCommand ble_ssh_client ssh-raspberrypi
+    ControlMaster auto
+    ControlPath /run/user/%i/ble-%C
+    ControlPersist 60s
+```
+
+The first `ssh pi-ble` opens the BLE link (a few seconds); later sessions, `scp` and `rsync`
+reuse it and start in a fraction of a second. The link closes `ControlPersist` after the
+last session ends, or at once with `ssh -O exit pi-ble`. Keep `ControlPath` short: a socket
+path can't exceed 108 characters. `ssh -O check pi-ble` counts as activity and restarts the
+`ControlPersist` timer.
+
+**Tools without `ProxyCommand`** (FileZilla, for example) connect to a local port that ssh
+forwards over the tunnel. With a session open through the alias above:
+
+```bash
+ssh -O forward -L 2222:localhost:22 pi-ble
+```
+
+then connect the tool to SFTP on `localhost`, port 2222, with the same user and key. Without
+`ControlMaster`, `ssh -f -N -L 2222:localhost:22 pi-ble` keeps the forward in the background
+instead; use one route at a time for a device, not both.
+
 ## Performance
 
 Expect roughly 10–50 kB/s depending on MTU, PHY and connection interval: fine for a shell,
 slow for large `scp` transfers. Measured from Windows (Python client) to a Raspberry Pi 5:
-256 KiB in 14 s including connection setup, about 20 kB/s.
+256 KiB in 14 s including connection setup, about 20 kB/s. From Linux (C client) to a
+Raspberry Pi 5: 1 MiB in 45 s up and 28 s down (23 and 36 KiB/s). A keystroke takes about
+80 ms there and back, which is comfortable for editing in `vi`.
 
 ## Sessions and link reuse
 
