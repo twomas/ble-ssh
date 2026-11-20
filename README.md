@@ -218,7 +218,7 @@ make BR2_EXTERNAL=/path/to/ble-ssh/buildroot menuconfig   # External options →
 | Option | Effect |
 |--------|--------|
 | `BR2_PACKAGE_BLE_SSH` | Builds `ble_ssh_server`. With systemd, installs the service enabled and creates the `ble-ssh` user. |
-| `BR2_PACKAGE_BLE_SSH_OPTS` | Written to `/etc/default/ble-ssh`, e.g. `--no-advertise` when your own GATT server advertises. |
+| `BR2_PACKAGE_BLE_SSH_OPTS` | Written to `/etc/default/ble-ssh`. On a product device with its own GATT server and power management, typically `--require-bonding --no-power-on --no-advertise`. |
 | `BR2_PACKAGE_BLE_SSH_CLIENT` | Also installs `ble_ssh_client` on the target. |
 
 You still need to:
@@ -229,6 +229,12 @@ You still need to:
 
 The package builds the release tag in `BLE_SSH_VERSION`. To build a local checkout instead,
 add `BLE_SSH_OVERRIDE_SRCDIR = /path/to/ble-ssh` to `local.mk` in your output directory.
+
+To carry the package in your own external tree instead, copy `buildroot/package/ble-ssh/`
+into it and source its `Config.in`. There you can pin a release or a commit, and add a
+`ble-ssh.hash` for your Buildroot version (`make ble-ssh-source`, then hash the tarball in
+`dl/ble-ssh/` and the two license files). This tree ships no hash file, because the
+tarball's name and hash depend on the Buildroot version.
 
 ## Client
 

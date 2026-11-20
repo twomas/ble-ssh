@@ -15,6 +15,9 @@ config BR2_PACKAGE_BLE_SSH
 	  "ReverseServiceDiscovery = false" in /etc/bluetooth/main.conf,
 	  typically set from a rootfs overlay.
 
+	  ble-ssh builds its own copy of bluez_inc (a git submodule)
+	  into its binaries; no bluez_inc library is installed.
+
 	  https://github.com/twomas/ble-ssh
 
 if BR2_PACKAGE_BLE_SSH
@@ -25,9 +28,12 @@ config BR2_PACKAGE_BLE_SSH_OPTS
 	help
 	  Written to /etc/default/ble-ssh as BLE_SSH_OPTS. Use
 	  "--no-advertise" when another program on the device already
-	  advertises, and "--no-power-on" when that program also owns
+	  advertises (clients then use that program's name or the
+	  address), and "--no-power-on" when another service owns
 	  adapter power. Add "--require-bonding" to accept only bonded
-	  centrals; see ble_ssh_server --help for other options.
+	  centrals; who may bond is up to the adapter's pairing agent.
+	  A product device typically uses all three. See
+	  ble_ssh_server --help for other options.
 
 config BR2_PACKAGE_BLE_SSH_CLIENT
 	bool "install ble_ssh_client"

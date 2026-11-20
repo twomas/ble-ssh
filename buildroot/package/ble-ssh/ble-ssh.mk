@@ -9,7 +9,7 @@ BLE_SSH_SITE = https://github.com/twomas/ble-ssh.git
 BLE_SSH_SITE_METHOD = git
 BLE_SSH_GIT_SUBMODULES = YES
 BLE_SSH_LICENSE = MIT
-BLE_SSH_LICENSE_FILES = LICENSE
+BLE_SSH_LICENSE_FILES = LICENSE external/bluez_inc/LICENSE
 BLE_SSH_DEPENDENCIES = host-pkgconf libglib2 bluez5_utils
 
 BLE_SSH_CONF_OPTS = \
