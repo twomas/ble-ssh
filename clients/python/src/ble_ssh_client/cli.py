@@ -184,6 +184,10 @@ async def open_tunnel(args: argparse.Namespace, disconnected: asyncio.Event, on_
         try:
             await client.connect()
             size = await subscribe(client, on_notify)
+            if client.is_connected:
+                # On BlueZ, connect() retries le-connection-abort-by-local itself and reports
+                # the dropped attempt through our disconnected_callback; that one is history.
+                disconnected.clear()
             return client, size
         except NoService as error:
             log(str(error))
