@@ -298,6 +298,11 @@ Ending a session cleanly matters because the BLE link can outlive the client:
 - **Windows keeps the link up** for a few seconds after a disconnect and reuses it for the
   next connection. The Python client therefore toggles notifications off and on when it
   starts, so a leftover subscription can't swallow the new session.
+- **The C client waits for the link to go down** before it exits (up to 5 s), so it doesn't
+  leave one behind. A link left up anyway (a client killed with `kill -9`) is dropped and
+  connected afresh, by name or by address. If another client on the same machine is using the
+  link, a new one exits with "in use" instead: BlueZ has one link per device, and the server
+  one session per link.
 - **Right after a previous connection**, the next attempt can hit the old link while it is
   still going away (`le-connection-abort-by-local`, `Not Connected`, or Windows' "the object
   has been closed"). Both clients retry until `--timeout`.

@@ -51,6 +51,13 @@ static gboolean stdin_eof = FALSE;
 static gboolean tunnel_up = FALSE;
 static guint stdin_watch = 0;
 static int exit_code = 255;
+static gboolean quitting = FALSE;    // disconnecting on the way out; exit once the link is down
+static guint quit_source = 0;
+static gboolean checking_linked = FALSE; // waiting for the GATT tree of a link that was already up
+static guint linked_wait_source = 0;
+
+#define QUIT_GRACE_MS 5000
+#define LINKED_WAIT_MS 3000
 
 static void msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 
@@ -68,6 +75,29 @@ static void msg(const char *fmt, ...) {
 static void quit(int code) {
     exit_code = code;
     g_main_loop_quit(loop);
+}
+
+static gboolean on_quit_grace(gpointer data) {
+    quit_source = 0;
+    debug("link still up after %d ms, exiting anyway", QUIT_GRACE_MS);
+    g_main_loop_quit(loop);
+    return G_SOURCE_REMOVE;
+}
+
+// Exit only after BlueZ has dropped the link. Disconnect() is an asynchronous D-Bus call:
+// quitting right after it can close our bus connection before the call goes out, and BlueZ
+// then keeps the link up with nobody using it.
+static void disconnect_and_quit(int code) {
+    exit_code = code;
+    if (device == NULL || binc_device_get_connection_state(device) == BINC_DISCONNECTED) {
+        g_main_loop_quit(loop);
+        return;
+    }
+    quitting = TRUE;
+    // Unsubscribing is what ends the session on the server, even if the link lingers.
+    if (tunnel_up) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    binc_device_disconnect(device); // a connect still in progress is dropped once it completes
+    if (quit_source == 0) quit_source = g_timeout_add(QUIT_GRACE_MS, on_quit_grace, NULL);
 }
 
 static gboolean on_timeout(gpointer data);
@@ -177,6 +207,11 @@ static void on_notify(Device *d, Characteristic *characteristic, const GByteArra
 }
 
 static void on_notify_state(Device *d, Characteristic *characteristic, const GError *error) {
+    if (error != NULL && (tunnel_up || quitting)) {
+        // Unsubscribing on the way out; BlueZ may already have ended the notify session.
+        debug("stopping notifications: %s", error->message);
+        return;
+    }
     if (error != NULL) {
         msg("enabling notifications failed: %s", error->message);
         binc_device_disconnect(device);
@@ -190,7 +225,13 @@ static void on_notify_state(Device *d, Characteristic *characteristic, const GEr
     }
 }
 
+static void handle_linked(void);
+
 static void on_services_resolved(Device *d) {
+    if (checking_linked) {
+        handle_linked();
+        return;
+    }
     if (!binc_device_has_service(device, BLE_SSH_SERVICE_UUID)) {
         msg("%s does not offer the ble-ssh service (is ble_ssh_server running there?)",
             binc_device_get_address(device));
@@ -240,6 +281,12 @@ static guint32 on_request_passkey(Device *d) {
 }
 
 static void on_connection_state(Device *d, ConnectionState state, const GError *error) {
+    if (quitting) {
+        debug("%s %s", binc_device_get_address(d), binc_device_get_connection_state_name(d));
+        if (state == BINC_CONNECTED && error == NULL) binc_device_disconnect(device);
+        else if (state == BINC_DISCONNECTED || error != NULL) g_main_loop_quit(loop);
+        return;
+    }
     if (error != NULL) {
         if (!tunnel_up) {
             // Errors like le-connection-abort-by-local are transient (the previous link is
@@ -268,6 +315,33 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
     if (state == BINC_DISCONNECTED) quit(tunnel_up ? 0 : 255);
 }
 
+// Decide what to do with a link that was already up when we started.
+static void handle_linked(void) {
+    checking_linked = FALSE;
+    if (linked_wait_source != 0) {
+        g_source_remove(linked_wait_source);
+        linked_wait_source = 0;
+    }
+    Characteristic *tx = binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    if (tx != NULL && binc_characteristic_is_notifying(tx)) {
+        // BlueZ has one link per device, and the server one session per link.
+        msg("the link to %s is in use by another client on this machine", binc_device_get_address(device));
+        device = NULL; // not ours to disconnect
+        quit(255);
+        return;
+    }
+    // Left behind by an earlier client. Drop it; on_connection_state then connects afresh.
+    debug("dropping a leftover link to %s", binc_device_get_address(device));
+    binc_device_disconnect(device);
+}
+
+static gboolean on_linked_wait(gpointer data) {
+    linked_wait_source = 0;
+    debug("services of the existing link not known after %d ms", LINKED_WAIT_MS);
+    handle_linked();
+    return G_SOURCE_REMOVE;
+}
+
 static void connect_to(Device *d) {
     device = d;
     binc_device_set_connection_state_change_cb(device, &on_connection_state);
@@ -276,15 +350,43 @@ static void connect_to(Device *d) {
     binc_device_set_notify_state_cb(device, &on_notify_state);
     binc_device_set_write_char_cb(device, &on_write);
     binc_device_set_bonding_state_changed_cb(device, &on_bonding_state_changed);
+    if (binc_device_get_connection_state(device) != BINC_DISCONNECTED) {
+        // A link that is already up: BlueZ won't Connect() it again. Whether another client is
+        // using it shows in TX's Notifying, which bluez_inc only knows once it has read the
+        // GATT tree; that happens in the background, so wait for it if needed.
+        if (binc_device_get_services(device) == NULL) {
+            checking_linked = TRUE;
+            linked_wait_source = g_timeout_add(LINKED_WAIT_MS, on_linked_wait, NULL);
+            return;
+        }
+        handle_linked();
+        return;
+    }
     debug("connecting to %s (%s)", binc_device_get_address(device),
           binc_device_get_name(device) ? binc_device_get_name(device) : "?");
     binc_device_connect(device);
 }
 
-static gboolean matches_target(Device *d) {
+static gboolean matches_name(Device *d) {
     const char *name = binc_device_get_name(d);
-    return g_ascii_strcasecmp(binc_device_get_address(d), target) == 0 ||
-           (name != NULL && g_str_equal(name, target));
+    const char *alias = binc_device_get_alias(d);
+    return (name != NULL && g_str_equal(name, target)) || (alias != NULL && g_str_equal(alias, target));
+}
+
+static gboolean matches_target(Device *d) {
+    return g_ascii_strcasecmp(binc_device_get_address(d), target) == 0 || matches_name(d);
+}
+
+// A server we are still linked to doesn't show up in a scan, so look among the links first.
+static Device *find_linked_by_name(void) {
+    Device *found = NULL;
+    GList *devices = binc_adapter_get_devices(adapter);
+    for (GList *it = devices; it != NULL && found == NULL; it = it->next) {
+        Device *d = it->data;
+        if (binc_device_get_connection_state(d) != BINC_DISCONNECTED && matches_name(d)) found = d;
+    }
+    g_list_free(devices);
+    return found;
 }
 
 static void on_scan_result(Adapter *a, Device *d) {
@@ -313,6 +415,12 @@ static void start(void) {
             connect_to(known);
             return;
         }
+    } else {
+        Device *linked = find_linked_by_name();
+        if (linked != NULL) {
+            connect_to(linked);
+            return;
+        }
     }
     // A server started with --no-advertise is reached through another program's advertisement,
     // which doesn't list our service UUID. So when we know the address, scan unfiltered; a name
@@ -334,17 +442,15 @@ static gboolean on_timeout(gpointer data) {
     timeout_source = 0;
     if (!tunnel_up) {
         msg("timed out after %d s waiting for %s", opt_timeout, target);
-        if (device != NULL) binc_device_disconnect(device);
-        quit(255);
+        disconnect_and_quit(255);
     }
     return G_SOURCE_REMOVE;
 }
 
 static gboolean on_terminate(gpointer data) {
-    if (device != NULL && tunnel_up) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
-    if (device != NULL) binc_device_disconnect(device);
-    quit(tunnel_up ? 0 : 255);
-    return G_SOURCE_REMOVE;
+    // ssh sends SIGHUP when the session ends, often right after closing our stdin.
+    if (!quitting) disconnect_and_quit(tunnel_up ? 0 : 255);
+    return G_SOURCE_CONTINUE; // a second signal while we wait is ignored; the grace timer ends it
 }
 
 static void on_binc_log(LogLevel level, const char *tag, const char *message) {
@@ -415,6 +521,7 @@ int main(int argc, char **argv) {
     }
     g_byte_array_free(outq, TRUE);
     g_main_loop_unref(loop);
+    g_dbus_connection_flush_sync(connection, NULL, NULL);
     g_dbus_connection_close_sync(connection, NULL, NULL);
     g_object_unref(connection);
     g_strfreev(opt_target);
