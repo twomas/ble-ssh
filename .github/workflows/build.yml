@@ -3,6 +3,8 @@ name: CMake Build
 on:
   push:
     branches: [ main ]
+    # A version tag builds a release (see the release job).
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
@@ -92,6 +94,78 @@ jobs:
           name: ble-ssh-${{ matrix.arch }}
           path: ${{github.workspace}}/install
           retention-days: 5
+
+  # Artifacts can only be downloaded by logged-in users and expire, so the same /usr trees are
+  # also published as release assets, which anyone can download:
+  #   - a tag vX.Y.Z gets its own release,
+  #   - every push to main updates the pre-release "main-latest".
+  # scripts/install-target.sh --release installs from them.
+  release:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One release update at a time, so main-latest never mixes files from two pushes.
+    concurrency:
+      group: release-${{ github.ref }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Check version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -e
+          tag=${GITHUB_REF_NAME}
+          py=v$(sed -n 's/^version = "\(.*\)"/\1/p' clients/python/pyproject.toml)
+          br=$(sed -n 's/^BLE_SSH_VERSION = //p' buildroot/package/ble-ssh/ble-ssh.mk)
+          echo "tag $tag, pyproject.toml $py, ble-ssh.mk $br"
+          if [ "$tag" != "$py" ] || [ "$tag" != "$br" ]; then
+            echo "::error::tag $tag does not match pyproject.toml ($py) and ble-ssh.mk ($br)"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -e
+          gh run download "$GITHUB_RUN_ID" --pattern 'ble-ssh-*' --dir artifacts
+          mkdir dist
+          for dir in artifacts/ble-ssh-*; do
+            name=$(basename "$dir")
+            # Artifacts do not keep file modes.
+            chmod 0755 "$dir"/usr/bin/*
+            tar -czf "dist/$name.tar.gz" -C "$dir" --owner=0 --group=0 --numeric-owner usr
+          done
+          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish release
+        run: |
+          set -e
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            tag=$GITHUB_REF_NAME
+            if gh release view "$tag" > /dev/null 2>&1; then
+              gh release upload "$tag" dist/* --clobber
+            else
+              gh release create "$tag" dist/* --verify-tag --title "ble-ssh $tag" --generate-notes
+            fi
+          else
+            tag=main-latest
+            notes="Newest build of main, from ${GITHUB_SHA::7}. Replaced on every push to main."
+            if gh release view "$tag" > /dev/null 2>&1; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true
+              gh release edit "$tag" --prerelease --notes "$notes"
+              gh release upload "$tag" dist/* --clobber
+            else
+              gh release create "$tag" dist/* --prerelease --target "$GITHUB_SHA" \
+                --title "Latest build of main" --notes "$notes"
+            fi
+          fi
 
   python-client:
     strategy:

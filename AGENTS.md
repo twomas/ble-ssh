@@ -31,8 +31,11 @@ CI ([.github/workflows/build.yml](.github/workflows/build.yml)) builds the C cod
 and arm64, on the newest Ubuntu and on Ubuntu 22.04. The 22.04 builds are the artifacts (a
 `/usr` tree): they must need no newer glibc than 2.35, and CMake caps the GLib API at
 `BLE_SSH_GLIB_API` (2.58), so they also run on older targets. Raising either is a decision,
-not a fix for a build error. It smoke-tests the Python client on Linux, Windows and macOS with the
-oldest and newest supported Python (3.10 and 3.14). The runners have no Bluetooth, so
+not a fix for a build error. After a push, the `release` job publishes the same trees as
+`ble-ssh-<arch>.tar.gz` with `SHA256SUMS`: a tag `vX.Y.Z` gets its own release, and main
+updates the pre-release `main-latest`. CI also
+smoke-tests the Python client on Linux, Windows and macOS with the oldest and newest
+supported Python (3.10 and 3.14). The runners have no Bluetooth, so
 anything that touches BLE has to be tested on real hardware (see below).
 
 ## Rules
@@ -48,7 +51,8 @@ anything that touches BLE has to be tested on real hardware (see below).
   options for the same things; a new option goes in both READMEs' option tables.
 - **Python 3.10+.** Use no newer syntax, and keep `requires-python` and the CI matrix in step.
 - **Versions:** `project.version` in `pyproject.toml`, the git tag `vX.Y.Z`, and
-  `BLE_SSH_VERSION` in `buildroot/package/ble-ssh/ble-ssh.mk` move together.
+  `BLE_SSH_VERSION` in `buildroot/package/ble-ssh/ble-ssh.mk` move together. The release job
+  refuses a tag that does not match both.
 
 ## Design points that are easy to break
 
