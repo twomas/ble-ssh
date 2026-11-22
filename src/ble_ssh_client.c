@@ -55,6 +55,8 @@ static gboolean quitting = FALSE;    // disconnecting on the way out; exit once 
 static guint quit_source = 0;
 static gboolean checking_linked = FALSE; // waiting for the GATT tree of a link that was already up
 static guint linked_wait_source = 0;
+static guint restart_source = 0;
+static gboolean linked = FALSE; // we had a link to device, so BlueZ may have read its GAP name
 
 #define QUIT_GRACE_MS 5000
 #define LINKED_WAIT_MS 3000
@@ -114,9 +116,15 @@ static gboolean on_reconnect(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-static void schedule_reconnect(void) {
-    // bluetoothd needs a moment to tear down the old link; connecting right away races with it.
-    if (reconnect_source == 0) reconnect_source = g_timeout_add(1000, on_reconnect, NULL);
+// After a link that was up, bluetoothd needs a moment to tear it down; connecting right away
+// races with it. A connect that failed (le-connection-abort-by-local: the controller sent the
+// connect request but never heard the server) has nothing to tear down, so try again sooner:
+// with a poor radio link most attempts fail like this, and each one is a new chance.
+#define RECONNECT_MS 1000
+#define RETRY_FAILED_MS 250
+
+static void schedule_reconnect(guint delay_ms) {
+    if (reconnect_source == 0) reconnect_source = g_timeout_add(delay_ms, on_reconnect, NULL);
 }
 
 static void start_stdin_watch(void);
@@ -292,7 +300,7 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
             // Errors like le-connection-abort-by-local are transient (the previous link is
             // still being torn down, or the radio was busy); keep trying until --timeout.
             debug("connect attempt failed (%s), retrying", error->message);
-            schedule_reconnect();
+            schedule_reconnect(RETRY_FAILED_MS);
             return;
         }
         msg("connect failed: %s", error->message);
@@ -300,16 +308,17 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
         return;
     }
     debug("%s %s", binc_device_get_address(d), binc_device_get_connection_state_name(d));
+    if (state == BINC_CONNECTED) linked = TRUE;
     if (reconnecting) {
         if (state == BINC_CONNECTED) reconnecting = FALSE;
-        else if (state == BINC_DISCONNECTED) schedule_reconnect();
+        else if (state == BINC_DISCONNECTED) schedule_reconnect(RECONNECT_MS);
         return;
     }
     if (state == BINC_DISCONNECTED && !tunnel_up && !giving_up && !stdin_eof) {
         // Dropped before the tunnel came up: usually the previous client's link still being
         // torn down. Try again until --timeout.
         debug("link dropped before the tunnel was up, retrying");
-        schedule_reconnect();
+        schedule_reconnect(RECONNECT_MS);
         return;
     }
     if (state == BINC_DISCONNECTED) quit(tunnel_up ? 0 : 255);
@@ -433,6 +442,38 @@ static void start(void) {
     binc_adapter_start_discovery(adapter);
 }
 
+static gboolean on_restart(gpointer data) {
+    restart_source = 0;
+    if (device == NULL && !quitting) start();
+    return G_SOURCE_REMOVE;
+}
+
+// BlueZ drops a device it found in a scan once it has been disconnected for a while (30 s by
+// default), also while we keep retrying a connect that fails. binc frees it right after this
+// callback, so forget it, and look for the server again (BlueZ has no other way back to it).
+static void on_device_removed(Adapter *a, Device *d) {
+    if (d != device) return;
+    debug("%s was removed by BlueZ", binc_device_get_address(d));
+    device = NULL;
+    checking_linked = FALSE;
+    if (reconnect_source != 0) {
+        g_source_remove(reconnect_source);
+        reconnect_source = 0;
+    }
+    if (linked_wait_source != 0) {
+        g_source_remove(linked_wait_source);
+        linked_wait_source = 0;
+    }
+    if (quitting || giving_up || tunnel_up || stdin_eof) {
+        g_main_loop_quit(loop);
+        return;
+    }
+    reconnecting = FALSE;
+    pairing_started = FALSE;
+    // Not from inside the callback: d is still in binc's device list until it returns.
+    if (restart_source == 0) restart_source = g_idle_add(on_restart, NULL);
+}
+
 static void on_powered(Adapter *a, gboolean state) {
     if (state && device == NULL) start();
 }
@@ -450,6 +491,19 @@ static gboolean on_terminate(gpointer data) {
     // ssh sends SIGHUP when the session ends, often right after closing our stdin.
     if (!quitting) disconnect_and_quit(tunnel_up ? 0 : 255);
     return G_SOURCE_CONTINUE; // a second signal while we wait is ignored; the grace timer ends it
+}
+
+// Once linked, BlueZ replaces the name the server advertises (in its scan response) with the
+// one its GAP service gives, which is the server's adapter Alias and often different, and
+// stores it with the device. A later lookup by name then misses the server until a scan
+// response gets through, which on a poor radio link can take long. So remove a device that
+// nothing keeps (not bonded, not trusted): BlueZ keeps the advertised name in its cache and
+// uses it again when the device next shows up in a scan.
+static void forget_device(void) {
+    if (!linked || binc_device_get_connection_state(device) != BINC_DISCONNECTED) return;
+    if (binc_device_get_bonding_state(device) != BINC_BOND_NONE || binc_device_get_trusted(device)) return;
+    debug("removing %s from BlueZ", binc_device_get_address(device));
+    binc_adapter_remove_device(adapter, device);
 }
 
 static void on_binc_log(LogLevel level, const char *tag, const char *message) {
@@ -504,6 +558,7 @@ int main(int argc, char **argv) {
         binc_agent_set_request_passkey_cb(agent, &on_request_passkey);
     }
     arm_timeout();
+    binc_adapter_set_device_removal_cb(adapter, &on_device_removed);
     binc_adapter_set_powered_state_cb(adapter, &on_powered);
     if (binc_adapter_get_powered_state(adapter)) {
         start();
@@ -514,6 +569,7 @@ int main(int argc, char **argv) {
     g_main_loop_run(loop);
 
     if (agent != NULL) binc_agent_free(agent);
+    if (adapter != NULL && device != NULL) forget_device();
     if (adapter != NULL) {
         if (binc_adapter_get_discovery_state(adapter) != BINC_DISCOVERY_STOPPED) binc_adapter_stop_discovery(adapter);
         binc_adapter_free(adapter);
