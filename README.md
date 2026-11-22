@@ -137,6 +137,36 @@ What the unit does:
 | Options | `/etc/default/ble-ssh` sets `BLE_SSH_OPTS`, e.g. `--no-advertise` or `--port 2222`. The file is optional. |
 | Privileges | Runs as the static system user `ble-ssh` (from `sysusers.d`) in a strict sandbox (`systemd-analyze security` rates it 1.3, "OK"). It only needs the system D-Bus and a loopback TCP connection to sshd. `DynamicUser=` isn't used because the classic `dbus-daemon` rejects dynamic users on the system bus. |
 
+### Install on another device over ssh
+
+`scripts/install-target.sh` installs the server and its service on a device you can reach
+with ssh, from Linux or from Git Bash on Windows. It needs systemd on the device and root or
+sudo there. Prebuilt binaries for arm64 and x86_64 (glibc 2.35 or newer) come from the GitHub
+releases, which need no login:
+
+```bash
+scripts/install-target.sh --release root@ssh-server              # newest release
+scripts/install-target.sh --release main-latest root@ssh-server  # newest build of main
+scripts/install-target.sh --build build root@ssh-server          # your own build
+scripts/install-target.sh --opts "--no-advertise" --release root@ssh-server
+scripts/install-target.sh --uninstall root@ssh-server
+```
+
+On Windows, run it in Git Bash. From PowerShell, call Git's bash by its path: a plain `bash`
+there is WSL's, which has its own ssh keys and file paths.
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" scripts/install-target.sh --release root@ssh-server
+```
+
+It asks the device for its architecture and checks that the binary runs there (glibc, GLib)
+before it changes anything. It warns, without stopping, when bluetoothd is missing, the
+[BlueZ configuration](#bluez-configuration-required) lacks `ReverseServiceDiscovery = false`,
+or nothing listens on the sshd port the service forwards to. An existing `/etc/default/ble-ssh` is kept unless you pass
+`--opts`. Files that are already there, e.g. from a buildroot package, are saved, and
+`--uninstall` puts them back and enables the service again as it was. Use `-n` to see what
+would happen, and `--help` for all options.
+
 ### BlueZ configuration (required)
 
 The server host needs two settings in `/etc/bluetooth/main.conf`. Edit the existing file

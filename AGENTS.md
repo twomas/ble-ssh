@@ -15,6 +15,7 @@ covers what isn't obvious from them.
 | `external/bluez_inc/` | Submodule: our fork of bluez_inc, the BlueZ D-Bus wrapper |
 | `systemd/` | Unit template, `/etc/default` example, sysusers |
 | `buildroot/` | br2-external tree with the `ble-ssh` package |
+| `scripts/install-target.sh` | Installs the server on a device over ssh (from a release, a build or an artifact) and removes it again |
 
 ## Build and check
 
@@ -33,7 +34,7 @@ and arm64, on the newest Ubuntu and on Ubuntu 22.04. The 22.04 builds are the ar
 `BLE_SSH_GLIB_API` (2.58), so they also run on older targets. Raising either is a decision,
 not a fix for a build error. After a push, the `release` job publishes the same trees as
 `ble-ssh-<arch>.tar.gz` with `SHA256SUMS`: a tag `vX.Y.Z` gets its own release, and main
-updates the pre-release `main-latest`. CI also
+updates the pre-release `main-latest`. `install-target.sh --release` downloads them. CI also
 smoke-tests the Python client on Linux, Windows and macOS with the oldest and newest
 supported Python (3.10 and 3.14). The runners have no Bluetooth, so
 anything that touches BLE has to be tested on real hardware (see below).
