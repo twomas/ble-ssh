@@ -11,6 +11,8 @@ ssh -o ProxyCommand="ble-ssh-client AA:BB:CC:DD:EE:FF" pi@server
 
 ### Install from a release
 
+Step by step for Windows, Linux and macOS: [docs/install.md](../../docs/install.md).
+
 Every GitHub release has the client as one wheel for Windows, macOS and Linux, so no
 checkout is needed (Python 3.10+ and [pipx](https://pipx.pypa.io/)). This installs
 `ble-ssh-client` and `ble-ssh-gui`:

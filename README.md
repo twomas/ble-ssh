@@ -139,6 +139,8 @@ What the unit does:
 
 ### Install a release
 
+Step by step, for a target and for client computers: [docs/install.md](docs/install.md).
+
 Every GitHub release, and the pre-release `main-latest` that each push to main rebuilds,
 has prebuilt binaries for arm64 and x86_64 (glibc 2.35 or newer). Downloading needs no
 login. `ble-ssh-<arch>.tar.gz` holds the `/usr` tree with `install.sh`, which installs the
