@@ -121,6 +121,10 @@ run_ssh() { ssh "${ssh_opts[@]}" "$target" "$@"; }
 cat > "$work/remote.sh" <<'REMOTE'
 #!/bin/sh
 set -eu
+# A non-login ssh shell, and sudo without secure_path, may leave out the sbin directories,
+# where BusyBox keeps addgroup and adduser.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
+export PATH
 here=$(cd "$(dirname "$0")" && pwd)
 state=/var/lib/ble-ssh-install
 manifest=$state/files
