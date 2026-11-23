@@ -40,6 +40,7 @@ typedef struct {
     guint retry_source; // pending TX retry timer
     guint16 mtu;
     GByteArray *tx;     // bytes from sshd not yet notified to the central
+    gboolean backend_eof; // sshd closed: end the session once tx is sent
     guint64 bytes_in;
     guint64 bytes_out;
 } Session;
@@ -129,6 +130,12 @@ static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer us
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         session->read_watch = 0;
+        if (n == 0 && session->tx->len > 0) {
+            // sshd's last bytes are still queued (its final packets): send them first;
+            // session_flush_tx() ends the session once they are out.
+            session->backend_eof = TRUE;
+            return G_SOURCE_REMOVE;
+        }
         // Keep the link: SSH ends the session in-band, and the client may reuse the link for
         // its next connection (Windows does); dropping it here would kill that one.
         session_close(session, n == 0 ? "backend closed" : g_strerror(errno), FALSE);
@@ -147,7 +154,7 @@ static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer us
 }
 
 static void session_resume_reading(Session *session) {
-    if (session->read_watch == 0 && session->fd >= 0 && session->tx->len < TX_LOW_WATER) {
+    if (session->read_watch == 0 && session->fd >= 0 && !session->backend_eof && session->tx->len < TX_LOW_WATER) {
         session->read_watch = g_unix_fd_add(session->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_backend_readable, session);
     }
 }
@@ -181,6 +188,10 @@ static void session_flush_tx(Session *session) {
             continue;
         }
         session_close(session, g_strerror(result), FALSE);
+        return;
+    }
+    if (session->backend_eof) {
+        session_close(session, "backend closed", FALSE);
         return;
     }
     session_resume_reading(session);
