@@ -137,12 +137,36 @@ What the unit does:
 | Options | `/etc/default/ble-ssh` sets `BLE_SSH_OPTS`, e.g. `--no-advertise` or `--port 2222`. The file is optional. |
 | Privileges | Runs as the static system user `ble-ssh` (from `sysusers.d`) in a strict sandbox (`systemd-analyze security` rates it 1.3, "OK"). It only needs the system D-Bus and a loopback TCP connection to sshd. `DynamicUser=` isn't used because the classic `dbus-daemon` rejects dynamic users on the system bus. |
 
+### Install a release
+
+Every GitHub release, and the pre-release `main-latest` that each push to main rebuilds,
+has prebuilt binaries for arm64 and x86_64 (glibc 2.35 or newer). Downloading needs no
+login. `ble-ssh-<arch>.tar.gz` holds the `/usr` tree with `install.sh`, which installs the
+server and its service on a device with systemd. Run it again with a newer tarball to
+update:
+
+```bash
+curl -fsSLO https://github.com/<owner>/<repo>/releases/latest/download/ble-ssh-arm64.tar.gz
+tar -xzf ble-ssh-arm64.tar.gz
+sudo ble-ssh-arm64/install.sh                         # -n first to only run the checks
+sudo /var/lib/ble-ssh-install/install.sh --uninstall  # later; works without the tarball
+```
+
 ### Install on another device over ssh
 
-`scripts/install-target.sh` installs the server and its service on a device you can reach
-with ssh, from Linux or from Git Bash on Windows. It needs systemd on the device and root or
-sudo there. Prebuilt binaries for arm64 and x86_64 (glibc 2.35 or newer) come from the GitHub
-releases, which need no login:
+`install-target.sh` does the same from another computer, Linux or Git Bash on Windows: it
+picks the tarball for the device's architecture, sends it over ssh and runs `install.sh`
+there. The copy attached to each release installs that release and needs nothing else:
+
+```bash
+curl -fsSLO https://github.com/<owner>/<repo>/releases/latest/download/install-target.sh
+bash install-target.sh root@ssh-server
+bash install-target.sh --uninstall root@ssh-server
+# or without saving it:
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/install-target.sh | bash -s -- root@ssh-server
+```
+
+From a checkout of this repository:
 
 ```bash
 scripts/install-target.sh --release root@ssh-server              # newest release
@@ -159,13 +183,13 @@ there is WSL's, which has its own ssh keys and file paths.
 & "C:\Program Files\Git\bin\bash.exe" scripts/install-target.sh --release root@ssh-server
 ```
 
-It asks the device for its architecture and checks that the binary runs there (glibc, GLib)
-before it changes anything. It warns, without stopping, when bluetoothd is missing, the
+Both check that the binary runs on the device (glibc, GLib) before they change anything.
+They warn, without stopping, when bluetoothd is missing, the
 [BlueZ configuration](#bluez-configuration-required) lacks `ReverseServiceDiscovery = false`,
-or nothing listens on the sshd port the service forwards to. An existing `/etc/default/ble-ssh` is kept unless you pass
-`--opts`. Files that are already there, e.g. from a buildroot package, are saved, and
-`--uninstall` puts them back and enables the service again as it was. Use `-n` to see what
-would happen, and `--help` for all options.
+or nothing listens on the sshd port the service forwards to. An existing
+`/etc/default/ble-ssh` is kept unless you pass `--opts`. Files that are already there, e.g.
+from a buildroot package, are saved, and `--uninstall` puts them back and enables the
+service again as it was. Use `-n` to see what would happen, and `--help` for all options.
 
 ### BlueZ configuration (required)
 

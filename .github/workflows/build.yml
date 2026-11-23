@@ -56,7 +56,14 @@ jobs:
 
       - name: Install Project
         # Staged with DESTDIR, so the artifact is a /usr tree that can be copied onto a target.
-        run: DESTDIR=${{github.workspace}}/install cmake --install ${{github.workspace}}/build
+        # install.sh and the /etc/default example go next to it: `sudo ./install.sh` on the
+        # device installs the tree, and scripts/install-target.sh runs it over ssh.
+        run: |
+          set -e
+          install=${{github.workspace}}/install
+          DESTDIR=$install cmake --install ${{github.workspace}}/build
+          cp scripts/install.sh "$install/install.sh"
+          cp systemd/ble-ssh.default "$install/ble-ssh.default"
 
       - name: Test Installation
         run: |
@@ -72,6 +79,8 @@ jobs:
           grep -qx "Type=notify" "$unit"
           "$install/usr/bin/ble_ssh_server" --help > /dev/null
           "$install/usr/bin/ble_ssh_client" --help > /dev/null
+          sh -n "$install/install.sh"
+          sh "$install/install.sh" --help > /dev/null
           echo "Installation test passed."
 
       - name: Check portability
@@ -95,13 +104,26 @@ jobs:
           path: ${{github.workspace}}/install
           retention-days: 5
 
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Shellcheck
+        run: |
+          shellcheck --version | sed -n 2p
+          shellcheck scripts/install.sh
+          shellcheck -x scripts/install-target.sh
+
   # Artifacts can only be downloaded by logged-in users and expire, so the same /usr trees are
   # also published as release assets, which anyone can download:
   #   - a tag vX.Y.Z gets its own release,
   #   - every push to main updates the pre-release "main-latest".
-  # scripts/install-target.sh --release installs from them.
+  # Each has ble-ssh-<arch>.tar.gz (the tree with install.sh), install-target.sh made to
+  # install that release without the repository, and SHA256SUMS.
   release:
-    needs: build
+    needs: [ build, scripts ]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -133,15 +155,23 @@ jobs:
       - name: Package
         run: |
           set -e
+          if [[ $GITHUB_REF == refs/tags/* ]]; then tag=$GITHUB_REF_NAME; else tag=main-latest; fi
           gh run download "$GITHUB_RUN_ID" --pattern 'ble-ssh-*' --dir artifacts
           mkdir dist
           for dir in artifacts/ble-ssh-*; do
             name=$(basename "$dir")
             # Artifacts do not keep file modes.
-            chmod 0755 "$dir"/usr/bin/*
-            tar -czf "dist/$name.tar.gz" -C "$dir" --owner=0 --group=0 --numeric-owner usr
+            chmod 0755 "$dir"/usr/bin/* "$dir/install.sh"
+            # One top directory: `tar -xzf` gives ble-ssh-<arch>/install.sh and its usr/ tree.
+            tar -czf "dist/$name.tar.gz" -C artifacts --owner=0 --group=0 --numeric-owner \
+              "$name/usr" "$name/install.sh" "$name/ble-ssh.default"
           done
-          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS)
+          # install-target.sh that works without the repository and installs this release.
+          sed -e "s|^baked_repo=\$|baked_repo=$GITHUB_REPOSITORY|" -e "s|^baked_tag=\$|baked_tag=$tag|" \
+            scripts/install-target.sh > dist/install-target.sh
+          grep -qx "baked_repo=$GITHUB_REPOSITORY" dist/install-target.sh
+          grep -qx "baked_tag=$tag" dist/install-target.sh
+          (cd dist && sha256sum ./* | sed 's# \./# #' > SHA256SUMS)
           cat dist/SHA256SUMS
 
       - name: Publish release

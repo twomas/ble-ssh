@@ -2,7 +2,8 @@
 # Install ble_ssh_server and its systemd service on a target over ssh, or remove it again.
 #
 # Runs on Linux and in Git Bash on Windows. The target needs systemd, sh, tar and gzip
-# (BusyBox is fine), and root or sudo for the login user.
+# (BusyBox is fine), and root or sudo for the login user. The work on the target is done
+# by install.sh (scripts/install.sh, also in every release tarball), which this sends there.
 #
 #   scripts/install-target.sh --release root@ssh-server            # newest release
 #   scripts/install-target.sh --release main-latest root@ssh-server   # newest build of main
@@ -10,41 +11,51 @@
 #   scripts/install-target.sh --artifact ble-ssh-arm64.zip root@ssh-server
 #   scripts/install-target.sh --uninstall root@ssh-server
 #
+# The copy attached to each GitHub release works on its own, without the repository:
+#
+#   curl -fsSLO https://github.com/<owner>/<repo>/releases/latest/download/install-target.sh
+#   bash install-target.sh root@ssh-server                         # installs that release
+#
 # Run with --help for all options.
 
 set -euo pipefail
 
+# Set by CI in the copy attached to a release: its repository and release tag.
+baked_repo=
+baked_tag=
+if [ -n "$baked_tag" ]; then default_source="--release $baked_tag"; else default_source="--build build"; fi
+
 usage() {
-    cat <<'EOF'
+    cat <<EOF
 Usage: install-target.sh [options] [user@]host
 
 Installs ble_ssh_server, ble-ssh-server.service and the sysusers.d file on the target,
 creates the ble-ssh user, installs /etc/default/ble-ssh if the target has none, then
-enables and (re)starts the service.
+enables and (re)starts the service. Run it again to update.
 
-Where the files come from (pick one; the default is --build build):
+Where the files come from (pick one; the default is $default_source):
   --release [TAG]    download ble-ssh-<arch>.tar.gz for the target's architecture from a
                      GitHub release and check it against SHA256SUMS: the newest release,
                      TAG (e.g. v0.1.3), or main-latest (rebuilt on every push to main).
                      Needs no GitHub login. BLE_SSH_RELEASE_URL=<url> uses a mirror that
                      holds the same files instead.
-  --build DIR        a CMake build directory (staged with `cmake --install`, Linux only)
+  --build DIR        a CMake build directory (staged with \`cmake --install\`, Linux only)
   --artifact PATH    a CI artifact: ble-ssh-<arch>.zip from a run's page on GitHub (needs a
                      login there), or its extracted folder
   --repo OWNER/NAME  GitHub repository for --release
-                     (default: from `git remote get-url origin`)
+                     (default: ${baked_repo:-from \`git remote get-url origin\`})
 
 What to do:
   --opts "OPTIONS"   set BLE_SSH_OPTS in /etc/default/ble-ssh, e.g. --opts "--no-advertise"
-                     (without it an existing file is kept, else the repo's example is used)
+                     (without it an existing file is kept)
   --client           also install ble_ssh_client
   --no-start         install, but do not enable or restart the service
   --uninstall        stop the service, remove what was installed and put back what was
                      there before (e.g. a buildroot package), enabled again if it was
   --purge            with --uninstall: also remove /etc/default/ble-ssh and the ble-ssh
                      user, if this script created them
-  -n, --dry-run      show what would be installed and run the checks on the target,
-                     change nothing there
+  -n, --dry-run      show what would be installed and run the checks on the target
+                     (or list what --uninstall would do), change nothing there
 
 ssh:
   -J JUMP            reach the target through a jump host (ssh -J)
@@ -52,25 +63,28 @@ ssh:
   -h, --help         this help
 
 The target is asked for its architecture first, and the binary must run there before
-anything is changed. It also warns (without stopping) when bluetoothd is missing,
+anything is changed. install.sh also warns (without stopping) when bluetoothd is missing,
 ReverseServiceDiscovery = false is not set in /etc/bluetooth/main.conf, or nothing listens
-on the backend port (--host/--port in BLE_SSH_OPTS, default 127.0.0.1:22). Files that already exist (e.g. from a buildroot package) are saved
-first, so --uninstall can put them back. The state is in /var/lib/ble-ssh-install.
+on the backend port. Files that already exist (e.g. from a buildroot package) are saved
+first, so --uninstall can put them back. The state, and a copy of install.sh, are in
+/var/lib/ble-ssh-install on the target: "sudo /var/lib/ble-ssh-install/install.sh
+--uninstall" works there too.
 EOF
 }
 
 die() { echo "install-target: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# No BASH_SOURCE when the release copy is piped in: curl -fsSL .../install-target.sh | bash -s -- HOST
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 
-source_kind=build
-source_arg=build
+source_kind=
+source_arg=
 release_tag=
 opts=
 have_opts=0
-repo=
+repo=$baked_repo
 with_client=0
 start=1
 action=install
@@ -92,7 +106,7 @@ while [ $# -gt 0 ]; do
         --repo) [ $# -ge 2 ] || die "--repo needs OWNER/NAME"; repo=$2; shift 2 ;;
         --client) with_client=1; shift ;;
         --opts) [ $# -ge 2 ] || die "--opts needs a string"
-            case $2 in *[\"\\\`\$]*) die "--opts: no quotes, backslashes or \$ please" ;; esac
+            case $2 in *[\"\'\\\`\$]*) die "--opts: no quotes, backslashes or \$ please" ;; esac
             opts=$2; have_opts=1; shift 2 ;;
         --no-start) start=0; shift ;;
         --uninstall) action=uninstall; shift ;;
@@ -108,6 +122,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$target" ] || { usage >&2; exit 2; }
 [ $purge -eq 0 ] || [ "$action" = uninstall ] || die "--purge only goes with --uninstall"
+if [ -z "$source_kind" ]; then
+    # The copy from a release installs that release; in the repository, the local build.
+    if [ -n "$baked_tag" ]; then source_kind=release; release_tag=$baked_tag
+    else source_kind=build; source_arg=build; fi
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -115,261 +134,17 @@ trap 'rm -rf "$work"' EXIT
 # shellcheck disable=SC2029  # the command strings are meant to be built here
 run_ssh() { ssh "${ssh_opts[@]}" "$target" "$@"; }
 
-# ---------------------------------------------------------------------------------------------
-# The part that runs on the target, as root. POSIX sh, so BusyBox systems work too.
-# Arguments: install START CLIENT | uninstall PURGE. Its own directory holds the payload.
-cat > "$work/remote.sh" <<'REMOTE'
-#!/bin/sh
-set -eu
-# A non-login ssh shell, and sudo without secure_path, may leave out the sbin directories,
-# where BusyBox keeps addgroup and adduser.
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
-export PATH
-here=$(cd "$(dirname "$0")" && pwd)
-state=/var/lib/ble-ssh-install
-manifest=$state/files
-unit=ble-ssh-server.service
-die() { echo "target: $*" >&2; exit 1; }
-
-[ -d /run/systemd/system ] || die "systemd is not running on this system"
-
-backup=$state/backup        # files that were there before the first install (e.g. a package)
-created=$state/created      # /etc/default/ble-ssh and the ble-ssh user, if this script made them
-was_enabled=$state/was-enabled
-
-listed() { [ -f "$2" ] && grep -qx "$1" "$2"; }
-warn() { echo "warning: $*" >&2; }
-
-# The BLE_SSH_OPTS the service will run with: --opts, else the existing file, else none.
-effective_opts() {
-    if [ -f "$here/opts" ]; then cat "$here/opts"
-    elif [ -f /etc/default/ble-ssh ]; then
-        # shellcheck disable=SC1091  # the target's file
-        (. /etc/default/ble-ssh && printf '%s\n' "${BLE_SSH_OPTS:-}")
-    fi
-}
-
-# Is something listening on TCP port $1 on loopback or on all addresses?
-listening() {
-    hex=$(printf '%04X' "$1")
-    awk -v port="$hex" '
-        $4 == "0A" {
-            split($2, a, ":")
-            if (a[2] == port && (a[1] == "0100007F" || a[1] ~ /^0+$/ || a[1] == "0000000000000000FFFF00000100007F" || a[1] == "00000000000000000000000001000000"))
-                found = 1
-        }
-        END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-}
-
-# What the service needs at run time but this script does not install. Only warnings:
-# a device may do these differently on purpose.
-check_runtime() {
-    if [ -z "$(systemctl list-unit-files --no-legend bluetooth.service 2>/dev/null)" ]; then
-        warn "bluetooth.service not found: ble-ssh needs BlueZ (bluetoothd)"
-    elif ! systemctl is-active --quiet bluetooth.service; then
-        echo "note: bluetooth.service is not running; ble-ssh-server starts it"
-    fi
-
-    conf=/etc/bluetooth/main.conf
-    if ! grep -Eqi '^[[:space:]]*ReverseServiceDiscovery[[:space:]]*=[[:space:]]*false' "$conf" 2>/dev/null; then
-        warn "ReverseServiceDiscovery = false is not set under [General] in $conf;"
-        warn "  clients may drop the link before the tunnel is up (README: BlueZ configuration)"
-    fi
-
-    # The backend sshd: --host/-H and --port/-p from the options, default 127.0.0.1:22.
-    port=22 host=127.0.0.1
-    # shellcheck disable=SC2046  # split the options into words, like systemd does
-    set -- $(effective_opts)
-    while [ $# -gt 0 ]; do
-        case $1 in
-            --port=*) port=${1#*=} ;;
-            --port|-p) port=${2:-22}; [ $# -lt 2 ] || shift ;;
-            -p?*) port=${1#-p} ;;
-            --host=*) host=${1#*=} ;;
-            --host|-H) host=${2:-}; [ $# -lt 2 ] || shift ;;
-            -H?*) host=${1#-H} ;;
-        esac
-        shift
-    done
-    case $port in ''|*[!0-9]*) warn "cannot read the backend port '$port' from BLE_SSH_OPTS"; return 0 ;; esac
-    case $host in
-        127.0.0.1|localhost|::1)
-            listening "$port" || warn "nothing listens on $host:$port; every BLE session will close at once (no sshd/dropbear?)" ;;
-        *) echo "note: backend is $host:$port, not checked from here" ;;
-    esac
-}
-
-# Put a file back from $backup, or remove it if there was none before.
-restore_or_remove() {
-    if [ -f "$backup$1" ]; then
-        mv -f "$backup$1" "$1" && echo "restored $1"
-    else
-        rm -f "$1" && echo "removed $1"
-    fi
-}
-
-# Everything that is checked before the system is changed. Leaves the cwd in the payload root.
-preflight() {
-    cd "$here/root"
-    server=$(find . -path '*/bin/ble_ssh_server' -type f | head -n 1)
-    [ -n "$server" ] || die "payload has no bin/ble_ssh_server"
-    chmod 0755 "$server"
-    # Check that the binary runs here before touching the system (architecture, glibc, GLib).
-    # LD_BIND_NOW resolves every symbol at load, so a too new GLib fails here and not only
-    # once the service reaches the missing function.
-    if ! LD_BIND_NOW=1 "$server" --help > /dev/null 2>"$here/check.err"; then
-        cat "$here/check.err" >&2
-        die "ble_ssh_server does not run on this target; nothing was installed"
-    fi
-    prefix=$(dirname "$(dirname "${server#.}")")
-    for other in /usr /usr/local; do
-        [ "$other" != "$prefix" ] || continue
-        if [ -e "$other/lib/systemd/system/$unit" ] && ! listed "$other/lib/systemd/system/$unit" "$manifest"; then
-            echo "note: $other/lib/systemd/system/$unit is also installed (from a package?)." >&2
-            echo "      systemd prefers the one in /usr/local; --uninstall brings the other back." >&2
-        fi
-    done
-    check_runtime
-}
-
-case $1 in
-check)
-    # Dry run: read-only, also without root.
-    preflight
-    echo "ble_ssh_server runs on this target"
-    ;;
-install)
-    start=$2
-    preflight
-
-    mkdir -p "$state" "$backup"
-    touch "$created"
-    # Remember how the service was set up before the first install, for --uninstall.
-    [ -f "$was_enabled" ] || systemctl is-enabled "$unit" > "$was_enabled" 2>/dev/null || true
-
-    if systemctl is-active --quiet "$unit"; then
-        systemctl stop "$unit"
-        echo "stopped $unit"
-    fi
-
-    : > "$manifest.new"
-    find . -type f | sort | while IFS= read -r f; do
-        f=${f#.}
-        # A file that is not ours yet belongs to someone else: keep a copy to put back.
-        if [ -e "$f" ] && ! listed "$f" "$manifest" && [ ! -e "$backup$f" ]; then
-            mkdir -p "$(dirname "$backup$f")"
-            cp -p "$f" "$backup$f"
-            echo "saved $f"
-        fi
-        case $f in */bin/*) mode=0755 ;; *) mode=0644 ;; esac
-        install -D -m "$mode" ".$f" "$f"
-        echo "$f" >> "$manifest.new"
-        echo "installed $f"
-    done
-    # Files from an earlier install that this one no longer ships (e.g. another prefix).
-    if [ -f "$manifest" ]; then
-        while IFS= read -r f; do
-            # Options set by an earlier --opts stay until --uninstall.
-            if [ "$f" = /etc/default/ble-ssh ]; then echo "$f" >> "$manifest.new"; continue; fi
-            listed "$f" "$manifest.new" || restore_or_remove "$f"
-        done < "$manifest"
-    fi
-    mv "$manifest.new" "$manifest"
-
-    if [ -f "$here/opts" ]; then
-        f=/etc/default/ble-ssh
-        if [ -e "$f" ] && ! listed "$f" "$manifest" && [ ! -e "$backup$f" ]; then
-            mkdir -p "$(dirname "$backup$f")"
-            cp -p "$f" "$backup$f"
-            echo "saved $f"
-        fi
-        mkdir -p /etc/default
-        {
-            echo "# Written by install-target.sh --opts; see \`ble_ssh_server --help\`."
-            printf 'BLE_SSH_OPTS="%s"\n' "$(cat "$here/opts")"
-        } > "$f"
-        chmod 0644 "$f"
-        listed "$f" "$manifest" || echo "$f" >> "$manifest"
-        echo "set $(tail -n 1 "$f") in $f"
-    elif [ ! -e /etc/default/ble-ssh ]; then
-        install -D -m 0644 "$here/ble-ssh.default" /etc/default/ble-ssh
-        echo default >> "$created"
-        echo "installed /etc/default/ble-ssh"
-    else
-        echo "kept existing /etc/default/ble-ssh: $(grep '^BLE_SSH_OPTS=' /etc/default/ble-ssh || true)"
-    fi
-
-    if ! id ble-ssh > /dev/null 2>&1; then
-        sysusers=$(grep '/sysusers.d/ble-ssh.conf$' "$manifest" || true)
-        if command -v systemd-sysusers > /dev/null 2>&1 && [ -n "$sysusers" ]; then
-            systemd-sysusers "$sysusers"
-        elif command -v useradd > /dev/null 2>&1; then
-            useradd --system --no-create-home --home-dir / --shell /sbin/nologin \
-                --comment "SSH over Bluetooth LE" ble-ssh
-        else
-            addgroup -S ble-ssh && adduser -S -D -H -h / -s /sbin/nologin -G ble-ssh ble-ssh
-        fi
-        id ble-ssh > /dev/null 2>&1 || die "could not create the ble-ssh user"
-        echo user >> "$created"
-        echo "created user ble-ssh"
-    fi
-
-    systemctl daemon-reload
-    if [ "$start" = 1 ]; then
-        # reenable: the unit may now come from another prefix than the old symlinks point to.
-        systemctl reenable "$unit"
-        # Type=notify: this returns once the GATT service is registered.
-        if ! systemctl restart "$unit"; then
-            journalctl -u "$unit" --no-pager -o cat -n 10 >&2 || true
-            die "$unit did not start; --uninstall puts the earlier version back"
-        fi
-        systemctl --no-pager --lines=5 status "$unit" || true
-    else
-        echo "not started (--no-start); start with: systemctl enable --now $unit"
-    fi
-    ;;
-uninstall)
-    purge=$2
-    [ -f "$manifest" ] || die "nothing to uninstall: $manifest not found (not installed by this script)"
-    systemctl disable --now "$unit" 2>/dev/null || true
-    while IFS= read -r f; do
-        [ -n "$f" ] && restore_or_remove "$f"
-    done < "$manifest"
-    before=$(cat "$was_enabled" 2>/dev/null || true)
-    if [ "$purge" = 1 ]; then
-        # Only what this script created; a package's settings and user stay.
-        if grep -qx default "$created" 2>/dev/null; then
-            rm -f /etc/default/ble-ssh && echo "removed /etc/default/ble-ssh"
-        fi
-        if grep -qx user "$created" 2>/dev/null && id ble-ssh > /dev/null 2>&1; then
-            if command -v userdel > /dev/null 2>&1; then userdel ble-ssh; else deluser ble-ssh; fi
-            echo "removed user ble-ssh"
-        fi
-    fi
-    rm -rf "$state"
-    systemctl daemon-reload
-    systemctl reset-failed "$unit" 2>/dev/null || true
-    # A unit that was there before (a package's) is enabled and started again as it was.
-    if [ -n "$(systemctl list-unit-files --no-legend "$unit" 2>/dev/null)" ]; then
-        case $before in
-            enabled|enabled-runtime)
-                systemctl enable "$unit" && systemctl start "$unit"
-                echo "re-enabled and started the earlier $unit"
-                systemctl --no-pager --lines=3 status "$unit" || true ;;
-            *) echo "the earlier $unit is back (not enabled, as before)" ;;
-        esac
-    fi
-    ;;
-*) die "unknown action $1" ;;
-esac
-REMOTE
+have() { command -v "$1" > /dev/null 2>&1; }
+# The Windows Store python3 stub exists but does not run.
+have_python() { have python3 && python3 -c 'import json' > /dev/null 2>&1; }
 
 # ---------------------------------------------------------------------------------------------
 # Ask the target what it is before building or downloading anything.
 
 info "Checking $target"
 # shellcheck disable=SC2016  # runs on the target
-probe=$(run_ssh 'echo "$(uname -m) $(id -u)"') || die "cannot log in to $target"
+# ssh reads stdin; when this script is piped into bash, that is the rest of the script.
+probe=$(run_ssh 'echo "$(uname -m) $(id -u)"' < /dev/null) || die "cannot log in to $target"
 read -r target_arch target_uid <<< "$probe"
 case $target_arch in
     aarch64|arm64) artifact_arch=arm64; elf_machine=183 ;;
@@ -380,15 +155,7 @@ if [ "$target_uid" = 0 ]; then sudo=; else sudo=sudo; fi
 echo "    architecture $target_arch, ${sudo:+not }root${sudo:+ (using sudo)}"
 
 # ---------------------------------------------------------------------------------------------
-# Collect the /usr (or /usr/local) tree to install into $work/payload/root.
-
-payload=$work/payload
-mkdir -p "$payload"
-cp "$work/remote.sh" "$payload/remote.sh"
-
-have() { command -v "$1" > /dev/null 2>&1; }
-# The Windows Store python3 stub exists but does not run.
-have_python() { have python3 && python3 -c 'import json' > /dev/null 2>&1; }
+# Get the /usr (or /usr/local) tree to install.
 
 extract_zip() {  # zip dir
     if have unzip; then unzip -q "$1" -d "$2"
@@ -447,6 +214,14 @@ find_root() {
     esac
 }
 
+# The payload sent to the target: install.sh, and to install also the usr/ tree and
+# ble-ssh.default. Release tarballs and CI artifacts carry their own install.sh, which
+# matches their binaries; otherwise the one next to this script is used.
+payload=$work/payload
+mkdir -p "$payload"
+q() { printf " '%s'" "$1"; }    # quote one argument for the target's shell
+args=
+
 if [ "$action" = install ]; then
     case $source_kind in
         build)
@@ -464,58 +239,52 @@ if [ "$action" = install ]; then
     esac
     root=$(find_root "$tree")
 
-    mkdir -p "$payload/root"
-    cp -R "$root"/. "$payload/root/"
-    # Only the server and what it needs; the client only on request.
-    [ $with_client -eq 1 ] || find "$payload/root" -name ble_ssh_client -type f -delete
-    find "$payload/root" -type f ! -path '*/bin/*' ! -path '*/lib/systemd/system/*' \
-        ! -path '*/lib/sysusers.d/*' -delete
-    cp "$repo_root/systemd/ble-ssh.default" "$payload/ble-ssh.default"
-    [ $have_opts -eq 0 ] || printf '%s\n' "$opts" > "$payload/opts"
+    cp -R "$root/usr" "$payload/"
+    if [ -f "$root/install.sh" ]; then cp "$root/install.sh" "$payload/"
+    elif [ -f "$script_dir/install.sh" ]; then cp "$script_dir/install.sh" "$payload/"
+    else die "no install.sh in $tree or next to this script"; fi
+    if [ -f "$root/ble-ssh.default" ]; then cp "$root/ble-ssh.default" "$payload/"
+    elif [ -f "$repo_root/systemd/ble-ssh.default" ]; then cp "$repo_root/systemd/ble-ssh.default" "$payload/"
+    fi
 
     # A wrong-architecture binary would also fail the check on the target; say why here.
-    server=$(find "$payload/root" -path '*/bin/ble_ssh_server' -type f)
+    server=$(find "$payload/usr" -path '*/bin/ble_ssh_server' -type f | head -n 1)
     if [ -n "$elf_machine" ]; then
         machine=$(od -An -t u2 -j 18 -N 2 "$server" | tr -d ' ')
         [ "$machine" = "$elf_machine" ] || die "the binary is not built for $target_arch (ELF machine $machine)"
     fi
 
-    info "Files for $target"
-    (cd "$payload/root" && find . -type f | sed 's#^\.#    #' | sort)
-    if [ $dry_run -eq 1 ]; then
-        # Run the checks on the target; they only read, so no sudo.
-        remote_args=check sudo='' action=check
-    else
-        remote_args="install $start"
-    fi
+    [ $have_opts -eq 0 ] || args+="$(q --opts)$(q "$opts")"
+    [ $with_client -eq 0 ] || args+=$(q --client)
+    [ $start -eq 1 ] || args+=$(q --no-start)
 else
-    if [ $dry_run -eq 1 ]; then
-        info "Would remove from $target:"
-        # shellcheck disable=SC2016  # runs on the target
-        run_ssh 's=/var/lib/ble-ssh-install
-            if [ ! -f "$s/files" ]; then echo "    nothing: not installed by this script"; exit 0; fi
-            sed "s|^|    remove   |" "$s/files"
-            [ -d "$s/backup" ] && (cd "$s/backup" && find . -type f | sed "s|^\.|    put back |")
-            echo "    service before install: $(cat "$s/was-enabled" 2>/dev/null || echo unknown)"'
-        exit 0
-    fi
-    remote_args="uninstall $purge"
+    # Uninstall needs no files; send install.sh if we have one, else the target's copy runs.
+    [ ! -f "$script_dir/install.sh" ] || cp "$script_dir/install.sh" "$payload/"
+    args=$(q --uninstall)
+    [ $purge -eq 0 ] || args+=$(q --purge)
+fi
+if [ $dry_run -eq 1 ]; then
+    # Only reads on the target, so no sudo.
+    args="$(q --dry-run)$args" sudo=''
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Copy the payload to a temporary directory on the target and run remote.sh there.
+# Copy the payload to a temporary directory on the target and run install.sh there.
 
-if [ "$action" = check ]; then info "Checks on $target (dry run)"; else info "${action^} on $target"; fi
-# shellcheck disable=SC2016  # $d is expanded on the target
+if [ $dry_run -eq 1 ]; then info "Dry run on $target"; else info "${action^} on $target"; fi
+# shellcheck disable=SC2016  # $d and $s are expanded on the target
 upload='d=$(mktemp -d) && gzip -dc | tar -xmf - -C "$d" && echo "$d"'
+# shellcheck disable=SC2016
+pick='if [ -f "$d/install.sh" ]; then s=$d/install.sh; else s=/var/lib/ble-ssh-install/install.sh; fi
+    [ -f "$s" ] || { echo "install-target: no install.sh here, and none on the target (not installed with it)" >&2; exit 1; }'
 if [ -z "$sudo" ]; then
-    # Root: one connection uploads and runs.
-    tar -czf - -C "$payload" . | run_ssh "$upload > /dev/null && sh \"\$d/remote.sh\" $remote_args; rc=\$?; rm -rf \"\$d\"; exit \$rc"
+    # Root (or a dry run): one connection uploads and runs.
+    tar -czf - -C "$payload" . | run_ssh "$upload > /dev/null && ( $pick; sh \"\$s\"$args ); rc=\$?; rm -rf \"\$d\"; exit \$rc"
 else
     # sudo may ask for a password, which needs the terminal, so upload first, then run.
     dir=$(tar -czf - -C "$payload" . | run_ssh "$upload")
-    tty=()
-    [ -t 0 ] && tty=(-t)
-    run_ssh "${tty[@]}" "sudo sh '$dir/remote.sh' $remote_args; rc=\$?; rm -rf '$dir'; exit \$rc"
+    cmd="d='$dir'; ( $pick; sudo sh \"\$s\"$args ); rc=\$?; rm -rf \"\$d\"; exit \$rc"
+    if [ -t 0 ]; then run_ssh -t "$cmd"
+    else run_ssh "$cmd" < /dev/null; fi    # piped in: sudo can then not ask for a password
 fi
-if [ "$action" = check ]; then echo "dry run: nothing changed on $target"; else info "Done"; fi
+if [ $dry_run -eq 1 ]; then echo "dry run: nothing changed on $target"; else info "Done"; fi
