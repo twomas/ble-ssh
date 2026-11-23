@@ -7,6 +7,10 @@
  *
  * stdout carries the tunnel, so all diagnostics go to stderr and bluez_inc's own
  * logger (which writes to stdout) is kept disabled.
+ *
+ * With --l2cap, a server that offers an LE L2CAP channel (ble_ssh_server --l2cap) is reached
+ * over that instead of GATT writes and notifications; otherwise GATT is used as before.
+ * Channels share the link, so a second client on this machine joins a link that is up.
  */
 
 #include <errno.h>
@@ -25,6 +29,7 @@
 #include "logger.h"
 
 #include "ble_ssh.h"
+#include "ble_ssh_l2cap.h"
 
 #define STDIN_HIGH_WATER (64 * 1024)
 #define READ_CHUNK 4096
@@ -57,6 +62,14 @@ static gboolean checking_linked = FALSE; // waiting for the GATT tree of a link 
 static guint linked_wait_source = 0;
 static guint restart_source = 0;
 static gboolean linked = FALSE; // we had a link to device, so BlueZ may have read its GAP name
+static gboolean opt_l2cap = FALSE;
+static int l2_fd = -1;           // the L2CAP channel, while connecting or up
+static guint l2_watch = 0;       // connect completion, then channel readable
+static guint l2_out_watch = 0;   // channel writable again, while outq waits for credits
+static guint16 l2_sndmtu = 0;
+static gboolean via_l2cap = FALSE;   // the tunnel runs over the channel, not GATT
+static gboolean joined_link = FALSE; // the link was up already (another client's): never drop it
+static gboolean l2_ended = FALSE;
 
 #define QUIT_GRACE_MS 5000
 #define LINKED_WAIT_MS 3000
@@ -97,7 +110,7 @@ static void disconnect_and_quit(int code) {
     }
     quitting = TRUE;
     // Unsubscribing is what ends the session on the server, even if the link lingers.
-    if (tunnel_up) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    if (tunnel_up && !via_l2cap) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
     binc_device_disconnect(device); // a connect still in progress is dropped once it completes
     if (quit_source == 0) quit_source = g_timeout_add(QUIT_GRACE_MS, on_quit_grace, NULL);
 }
@@ -135,7 +148,198 @@ static gsize chunk_size(void) {
     return CLAMP(size, BLE_SSH_MIN_CHUNK, BLE_SSH_MAX_CHUNK);
 }
 
+// ---------------------------------------------------------------------------------------
+// L2CAP channel (--l2cap)
+
+static int l2_end_code = 0;
+static guint l2_drain_source = 0;
+static guint l2_drain_tries = 0;
+
+static void l2_finish(void) {
+    const int code = l2_end_code;
+    if (l2_watch != 0) g_source_remove(l2_watch);
+    if (l2_out_watch != 0) g_source_remove(l2_out_watch);
+    l2_watch = l2_out_watch = 0;
+    if (l2_fd >= 0) close(l2_fd);
+    l2_fd = -1;
+    if (joined_link) {
+        device = NULL; // not ours to disconnect or forget
+        quit(code);
+        return;
+    }
+    disconnect_and_quit(code);
+}
+
+static gboolean on_l2_drain(gpointer data) {
+    if (ble_ssh_l2cap_unsent(l2_fd) > 0 && ++l2_drain_tries < BLE_SSH_L2CAP_DRAIN_TRIES) return G_SOURCE_CONTINUE;
+    if (l2_drain_tries >= BLE_SSH_L2CAP_DRAIN_TRIES) debug("L2CAP channel not drained, closing anyway");
+    l2_drain_source = 0;
+    l2_finish();
+    return G_SOURCE_REMOVE;
+}
+
+// Close the channel, which ends the session on the server, and leave. A link we joined
+// belongs to another client: leave it up. close() drops what the kernel has not sent yet,
+// so on a normal end wait for that first.
+static void l2_end(int code) {
+    if (l2_ended) return;
+    l2_ended = TRUE;
+    l2_end_code = code;
+    if (code == 0 && l2_fd >= 0 && via_l2cap && ble_ssh_l2cap_unsent(l2_fd) > 0) {
+        l2_drain_source = g_timeout_add(BLE_SSH_L2CAP_DRAIN_MS, on_l2_drain, NULL);
+        return;
+    }
+    l2_finish();
+}
+
+static gboolean on_l2_writable(gint fd, GIOCondition condition, gpointer user_data);
+
+static void l2_pump(void) {
+    if (!tunnel_up || l2_out_watch != 0 || l2_fd < 0) return;
+    while (outq->len > 0) {
+        const gsize len = MIN(outq->len, l2_sndmtu);
+        const ssize_t n = send(l2_fd, outq->data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Out of credits: the server hasn't taken the earlier SDUs yet.
+                l2_out_watch = g_unix_fd_add(l2_fd, G_IO_OUT, on_l2_writable, NULL);
+                return;
+            }
+            msg("L2CAP send: %s", g_strerror(errno));
+            l2_end(255);
+            return;
+        }
+        g_byte_array_remove_range(outq, 0, (guint) n);
+    }
+    if (stdin_eof) {
+        debug("stdin closed, closing the L2CAP channel");
+        l2_end(0);
+        return;
+    }
+    start_stdin_watch();
+}
+
+static gboolean on_l2_writable(gint fd, GIOCondition condition, gpointer user_data) {
+    l2_out_watch = 0;
+    l2_pump();
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_l2_readable(gint fd, GIOCondition condition, gpointer user_data) {
+    guint8 buf[BLE_SSH_L2CAP_MTU];
+    const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
+    if (n <= 0) {
+        l2_watch = 0;
+        debug("L2CAP channel closed (%s)", n == 0 ? "by the server" : g_strerror(errno));
+        l2_end(0);
+        return G_SOURCE_REMOVE;
+    }
+    const guint8 *data = buf;
+    gsize len = (gsize) n;
+    while (len > 0) {
+        const ssize_t w = write(STDOUT_FILENO, data, len);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            msg("stdout: %s", g_strerror(errno));
+            l2_watch = 0;
+            l2_end(255);
+            return G_SOURCE_REMOVE;
+        }
+        data += w;
+        len -= (gsize) w;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void start_gatt(void) {
+    binc_device_start_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+}
+
+static gboolean on_l2_connected(gint fd, GIOCondition condition, gpointer user_data) {
+    l2_watch = 0;
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno;
+    if (err == 0 && (condition & (G_IO_ERR | G_IO_HUP))) err = ECONNRESET;
+    if (err != 0) {
+        debug("L2CAP channel failed (%s), using GATT", g_strerror(err));
+        close(fd);
+        l2_fd = -1;
+        start_gatt();
+        return G_SOURCE_REMOVE;
+    }
+    l2_sndmtu = ble_ssh_l2cap_sndmtu(fd);
+    via_l2cap = TRUE;
+    tunnel_up = TRUE;
+    debug("tunnel up over L2CAP (send mtu %u)", l2_sndmtu);
+    l2_watch = g_unix_fd_add(fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_readable, NULL);
+    start_stdin_watch();
+    l2_pump();
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean l2_connect(guint16 psm) {
+    // A bonded link is encrypted with the stored keys; a server with --require-bonding wants it.
+    const gboolean bonded = binc_device_get_bonding_state(device) == BINC_BONDED;
+    const int fd = ble_ssh_l2cap_socket(SOCK_NONBLOCK, bonded ? BLE_SSH_BT_SECURITY_MEDIUM : BLE_SSH_BT_SECURITY_LOW, 0);
+    if (fd < 0) {
+        debug("L2CAP socket: %s", g_strerror(errno));
+        return FALSE;
+    }
+    struct ble_ssh_sockaddr_l2 addr = {0};
+    addr.l2_family = AF_BLUETOOTH;
+    addr.l2_psm = ble_ssh_htobs(psm);
+    const char *type = binc_device_get_address_type(device);
+    addr.l2_bdaddr_type = g_strcmp0(type, "random") == 0 ? BLE_SSH_BDADDR_LE_RANDOM : BLE_SSH_BDADDR_LE_PUBLIC;
+    if (ble_ssh_str2ba(binc_device_get_address(device), &addr.l2_bdaddr) < 0 ||
+        (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0 && errno != EINPROGRESS)) {
+        debug("L2CAP connect to PSM 0x%02x: %s", psm, g_strerror(errno));
+        close(fd);
+        return FALSE;
+    }
+    debug("opening L2CAP channel to PSM 0x%02x (%s address)", psm, type ? type : "public");
+    l2_fd = fd;
+    l2_watch = g_unix_fd_add(fd, G_IO_OUT | G_IO_ERR | G_IO_HUP, on_l2_connected, NULL);
+    return TRUE;
+}
+
+static void on_read_char(Device *d, Characteristic *characteristic, const GByteArray *byteArray, const GError *error) {
+    if (!g_str_equal(binc_characteristic_get_uuid(characteristic), BLE_SSH_PSM_UUID) || tunnel_up || l2_fd >= 0) return;
+    if (error != NULL && binc_device_get_connection_state(device) != BINC_CONNECTED) {
+        // The link dropped while reading (desktop servers do that, see the README); the
+        // reconnect reads again once the services are resolved.
+        debug("reading the L2CAP PSM ended with the link (%s)", error->message);
+        return;
+    }
+    if (error != NULL || byteArray == NULL || byteArray->len < 2) {
+        debug("could not read the server's L2CAP PSM (%s), using GATT", error ? error->message : "short value");
+        start_gatt();
+        return;
+    }
+    const guint16 psm = (guint16) (byteArray->data[0] | (byteArray->data[1] << 8));
+    if (!l2_connect(psm)) start_gatt();
+}
+
+// Open the tunnel: over an L2CAP channel when asked for and offered, else over GATT.
+static void start_tunnel(void) {
+    if (opt_l2cap && binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID) != NULL) {
+        if (binc_device_read_char(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID)) return;
+        debug("reading the server's L2CAP PSM failed, using GATT");
+    } else if (opt_l2cap) {
+        debug("the server offers no L2CAP channel, using GATT");
+    }
+    start_gatt();
+}
+
+// ---------------------------------------------------------------------------------------
+
 static void pump_writes(void) {
+    if (via_l2cap || l2_fd >= 0) {
+        l2_pump();
+        return;
+    }
     if (write_in_flight || !tunnel_up) return;
     if (outq->len == 0) {
         if (stdin_eof) {
@@ -199,6 +403,9 @@ static void start_stdin_watch(void) {
 
 static void on_notify(Device *d, Characteristic *characteristic, const GByteArray *byteArray) {
     if (!g_str_equal(binc_characteristic_get_uuid(characteristic), BLE_SSH_TX_UUID)) return;
+    // BlueZ signals TX's value to every process watching the device: on a shared link these
+    // are another client's GATT session (only ours when we subscribed ourselves).
+    if (via_l2cap || l2_fd >= 0 || joined_link || !tunnel_up) return;
     const guint8 *data = byteArray->data;
     gsize len = byteArray->len;
     while (len > 0) {
@@ -255,7 +462,7 @@ static void on_services_resolved(Device *d) {
         binc_device_pair(device);
         return;
     }
-    binc_device_start_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    start_tunnel();
 }
 
 static void on_bonding_state_changed(Device *d, BondingState new_state, BondingState old_state, const GError *error) {
@@ -331,6 +538,13 @@ static void handle_linked(void) {
         g_source_remove(linked_wait_source);
         linked_wait_source = 0;
     }
+    if (opt_l2cap && binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID) != NULL) {
+        // L2CAP channels share the link, each its own session: join it instead of dropping it.
+        debug("joining the link to %s that is already up", binc_device_get_address(device));
+        joined_link = TRUE;
+        start_tunnel();
+        return;
+    }
     Characteristic *tx = binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
     if (tx != NULL && binc_characteristic_is_notifying(tx)) {
         // BlueZ has one link per device, and the server one session per link.
@@ -358,6 +572,7 @@ static void connect_to(Device *d) {
     binc_device_set_notify_char_cb(device, &on_notify);
     binc_device_set_notify_state_cb(device, &on_notify_state);
     binc_device_set_write_char_cb(device, &on_write);
+    binc_device_set_read_char_cb(device, &on_read_char);
     binc_device_set_bonding_state_changed_cb(device, &on_bonding_state_changed);
     if (binc_device_get_connection_state(device) != BINC_DISCONNECTED) {
         // A link that is already up: BlueZ won't Connect() it again. Whether another client is
@@ -482,14 +697,17 @@ static gboolean on_timeout(gpointer data) {
     timeout_source = 0;
     if (!tunnel_up) {
         msg("timed out after %d s waiting for %s", opt_timeout, target);
-        disconnect_and_quit(255);
+        if (joined_link || l2_fd >= 0) l2_end(255);
+        else disconnect_and_quit(255);
     }
     return G_SOURCE_REMOVE;
 }
 
 static gboolean on_terminate(gpointer data) {
     // ssh sends SIGHUP when the session ends, often right after closing our stdin.
-    if (!quitting) disconnect_and_quit(tunnel_up ? 0 : 255);
+    if (quitting) return G_SOURCE_CONTINUE;
+    if (via_l2cap || joined_link || l2_fd >= 0) l2_end(tunnel_up ? 0 : 255);
+    else disconnect_and_quit(tunnel_up ? 0 : 255);
     return G_SOURCE_CONTINUE; // a second signal while we wait is ignored; the grace timer ends it
 }
 
@@ -516,6 +734,8 @@ int main(int argc, char **argv) {
         {"reliable", 'r', 0, G_OPTION_ARG_NONE, &opt_reliable, "Use write-with-response (slower)", NULL},
         {"pair", 'p', 0, G_OPTION_ARG_NONE, &opt_pair,
          "Bond with the server first (needed for servers started with --require-bonding)", NULL},
+        {"l2cap", 'L', 0, G_OPTION_ARG_NONE, &opt_l2cap,
+         "Use the server's L2CAP channel if it offers one (ble_ssh_server --l2cap), else GATT", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Print progress to stderr", NULL},
         {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_target, NULL, "ADDRESS|NAME"},
         {NULL}};
