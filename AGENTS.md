@@ -34,7 +34,8 @@ and arm64, on the newest Ubuntu and on Ubuntu 22.04. The 22.04 builds are the ar
 `/usr` tree): they must need no newer glibc than 2.35, and CMake caps the GLib API at
 `BLE_SSH_GLIB_API` (2.58), so they also run on older targets. Raising either is a decision,
 not a fix for a build error. After a push, the `release` job publishes the same trees with
-`install.sh` as `ble-ssh-<arch>.tar.gz`, plus `install-target.sh` and `SHA256SUMS`: a tag
+`install.sh` as `ble-ssh-<arch>.tar.gz`, plus `install-target.sh`, the Python client's wheel
+(on main its version gets `+g<commit>`) and `SHA256SUMS`: a tag
 `vX.Y.Z` gets its own release, and main updates the pre-release `main-latest`. CI also
 shellchecks both scripts, and
 smoke-tests the Python client on Linux, Windows and macOS with the oldest and newest
@@ -53,9 +54,10 @@ anything that touches BLE has to be tested on real hardware (see below).
 - **Keep the clients' command lines in step.** The C and Python clients take the same
   options for the same things; a new option goes in both READMEs' option tables.
 - **Python 3.10+.** Use no newer syntax, and keep `requires-python` and the CI matrix in step.
-- **Versions:** `project.version` in `pyproject.toml`, the git tag `vX.Y.Z`, and
+- **Versions:** `project.version` in `pyproject.toml`, `__version__` in
+  `clients/python/src/ble_ssh_client/__init__.py`, the git tag `vX.Y.Z`, and
   `BLE_SSH_VERSION` in `buildroot/package/ble-ssh/ble-ssh.mk` move together. The release job
-  refuses a tag that does not match both.
+  refuses a tag that does not match all three.
 
 ## Design points that are easy to break
 

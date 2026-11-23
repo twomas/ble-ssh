@@ -9,6 +9,34 @@ pipx install ./clients/python          # or: pip install ./clients/python
 ssh -o ProxyCommand="ble-ssh-client AA:BB:CC:DD:EE:FF" pi@server
 ```
 
+### Install from a release
+
+Every GitHub release has the client as one wheel for Windows, macOS and Linux, so no
+checkout is needed (Python 3.10+ and [pipx](https://pipx.pypa.io/)). This installs
+`ble-ssh-client` and `ble-ssh-gui`:
+
+```bash
+pipx install https://github.com/<owner>/<repo>/releases/download/v0.1.3/ble_ssh_client-0.1.3-py3-none-any.whl
+```
+
+The pre-release `main-latest` has the newest build of main. Its wheel's version carries the
+commit (e.g. `0.1.2+g9fc43be`), so look the name up in `SHA256SUMS`:
+
+```bash
+b=https://github.com/<owner>/<repo>/releases/download/main-latest
+pipx install --force "$b/$(curl -fsSL "$b/SHA256SUMS" | grep -o 'ble_ssh_client-[^ ]*\.whl')"
+```
+
+```powershell
+$b = "https://github.com/<owner>/<repo>/releases/download/main-latest"
+$whl = (Invoke-RestMethod "$b/SHA256SUMS") -split "\s+" | Where-Object { $_ -like "ble_ssh_client-*.whl" }
+pipx install --force "$b/$whl"
+```
+
+Run the same command again to update; `--force` replaces the installed version. Without
+pipx, `python -m pip install --user --force-reinstall <URL of the wheel>` (on Windows
+`py -m pip ...`) does the same.
+
 Find servers and set up an ssh alias:
 
 ```console

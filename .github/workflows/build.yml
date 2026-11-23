@@ -121,7 +121,7 @@ jobs:
   #   - a tag vX.Y.Z gets its own release,
   #   - every push to main updates the pre-release "main-latest".
   # Each has ble-ssh-<arch>.tar.gz (the tree with install.sh), install-target.sh made to
-  # install that release without the repository, and SHA256SUMS.
+  # install that release without the repository, the Python client's wheel, and SHA256SUMS.
   release:
     needs: [ build, scripts ]
     if: github.event_name == 'push'
@@ -145,19 +145,35 @@ jobs:
           set -e
           tag=${GITHUB_REF_NAME}
           py=v$(sed -n 's/^version = "\(.*\)"/\1/p' clients/python/pyproject.toml)
+          init=v$(sed -n 's/^__version__ = "\(.*\)"/\1/p' clients/python/src/ble_ssh_client/__init__.py)
           br=$(sed -n 's/^BLE_SSH_VERSION = //p' buildroot/package/ble-ssh/ble-ssh.mk)
-          echo "tag $tag, pyproject.toml $py, ble-ssh.mk $br"
-          if [ "$tag" != "$py" ] || [ "$tag" != "$br" ]; then
-            echo "::error::tag $tag does not match pyproject.toml ($py) and ble-ssh.mk ($br)"
+          echo "tag $tag, pyproject.toml $py, __init__.py $init, ble-ssh.mk $br"
+          if [ "$tag" != "$py" ] || [ "$tag" != "$init" ] || [ "$tag" != "$br" ]; then
+            echo "::error::tag $tag does not match pyproject.toml ($py), __init__.py ($init) and ble-ssh.mk ($br)"
             exit 1
           fi
+
+      - name: Build Python client
+        # One pure-Python wheel for Windows, macOS and Linux: pipx install <its URL>.
+        run: |
+          set -e
+          mkdir -p dist
+          if [[ $GITHUB_REF != refs/tags/* ]]; then
+            # A build of main is not the release of its version: add the commit (a PEP 440
+            # local version), which --version and the GUI's title then show.
+            v=$(sed -n 's/^version = "\(.*\)"/\1/p' clients/python/pyproject.toml)+g${GITHUB_SHA::7}
+            sed -i "s/^version = \".*\"/version = \"$v\"/" clients/python/pyproject.toml
+            sed -i "s/^__version__ = \".*\"/__version__ = \"$v\"/" clients/python/src/ble_ssh_client/__init__.py
+          fi
+          pipx run build --wheel --outdir dist clients/python
+          ls dist
 
       - name: Package
         run: |
           set -e
           if [[ $GITHUB_REF == refs/tags/* ]]; then tag=$GITHUB_REF_NAME; else tag=main-latest; fi
           gh run download "$GITHUB_RUN_ID" --pattern 'ble-ssh-*' --dir artifacts
-          mkdir dist
+          mkdir -p dist
           for dir in artifacts/ble-ssh-*; do
             name=$(basename "$dir")
             # Artifacts do not keep file modes.
@@ -191,6 +207,10 @@ jobs:
               gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true
               gh release edit "$tag" --prerelease --notes "$notes"
               gh release upload "$tag" dist/* --clobber
+              # Drop what this build no longer has: the wheel's name changes with every commit.
+              gh release view "$tag" --json assets --jq '.assets[].name' | while read -r asset; do
+                [ -e "dist/$asset" ] || gh release delete-asset "$tag" "$asset" --yes
+              done
             else
               gh release create "$tag" dist/* --prerelease --target "$GITHUB_SHA" \
                 --title "Latest build of main" --notes "$notes"

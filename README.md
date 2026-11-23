@@ -300,7 +300,7 @@ There are two clients with the same command line:
 |---|---|---|
 | Platforms | Linux (BlueZ) | Windows, macOS, Linux |
 | Dependencies | none at runtime | Python 3.10+, [bleak](https://github.com/hbldh/bleak) |
-| Install | built with the server | `pipx install ./clients/python` |
+| Install | built with the server, or `--client` with a release's `install.sh` | `pipx install` the wheel from a release ([how](clients/python/README.md#install-from-a-release)), or `./clients/python` |
 | Use it for | embedded and headless Linux | developer laptops |
 
 The Python client is documented in [clients/python](clients/python/README.md). It can also
