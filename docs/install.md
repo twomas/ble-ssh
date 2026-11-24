@@ -47,7 +47,7 @@ Useful options:
 
 | Option | |
 |--------|-|
-| `--opts "..."` | Server options for the service, e.g. `--opts "--no-power-on --require-bonding --no-advertise"` on a target whose own program owns the adapter. Without it, an existing `/etc/default/ble-ssh` is kept |
+| `--opts "..."` | Server options for the service, e.g. `--opts "--no-power-on --require-bonding --no-advertise"` on a target whose own program owns the adapter, or add `--l2cap` to also accept sessions over L2CAP channels ([what that gives](l2cap.md)). Without it, an existing `/etc/default/ble-ssh` is kept |
 | `-J user@jumphost` | Reach the target through another machine, e.g. a target on USB behind a Raspberry Pi |
 | `--client` | Also install the C client `ble_ssh_client` on the target |
 | `--release vX.Y.Z` | Another release than the one the script came from |
@@ -143,8 +143,7 @@ sudo install -m 0755 ble-ssh-arm64/usr/bin/ble_ssh_client /usr/local/bin/
 
 ## Connect
 
-The GUI finds servers, connects and opens ssh. From a terminal (the C client is
-`ble_ssh_client`, with the same options):
+The GUI finds servers, connects and opens ssh. From a terminal, with the Python client:
 
 ```bash
 ble-ssh-client --scan                                   # servers nearby
@@ -154,6 +153,14 @@ ssh ssh-server-ble
 ```
 
 In PowerShell, append to `$env:USERPROFILE\.ssh\config` instead.
+
+The C client, `ble_ssh_client`, has no `--scan` or `--ssh-config`; give it the server's name
+or address as `ProxyCommand`. On a target started with `--l2cap`, add `--l2cap` to use its
+L2CAP channel, which lets several sessions from one computer share the link:
+
+```bash
+ssh -o ProxyCommand="ble_ssh_client --l2cap ssh-server" pi@ssh-server
+```
 
 A target with `--require-bonding` only accepts a client that is paired with it. Pair once,
 then connect as usual; the first connection right after pairing is refused, the next one
