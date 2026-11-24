@@ -50,7 +50,8 @@ Try it in the foreground first:
 ```bash
 ./build/ble_ssh_server            # advertises as ssh-<hostname>, forwards to 127.0.0.1:22
 ./build/ble_ssh_server --help     # --port, --host, --name, --adapter-name, --max-clients,
-                                  # --no-advertise, --no-power-on, --require-bonding, --verbose
+                                  # --no-advertise, --no-power-on, --require-bonding,
+                                  # --l2cap, --psm, --verbose
 ```
 
 To advertise under the name the device already has, use `--adapter-name`: the server
@@ -110,6 +111,31 @@ pairing is rejected, and the next one works. SSH still provides its own end-to-e
 encryption and authentication on top.
 
 For the systemd service, set the options in `/etc/default/ble-ssh` (see below).
+
+### L2CAP channels (`--l2cap`, prototype)
+
+With `--l2cap` the server also accepts sessions over LE L2CAP connection-oriented channels,
+next to GATT, which stays as it is. It publishes the channel's PSM in a GATT characteristic
+(see [Protocol](#protocol)); `--psm N` picks it (128-255), otherwise the kernel does.
+
+```bash
+./build/ble_ssh_server --l2cap
+ssh -o ProxyCommand="ble_ssh_client --l2cap ssh-raspberrypi" pi@raspberrypi
+```
+
+- **Only the C client** uses the channel, with `--l2cap`. The Python client, and so Windows,
+  always uses GATT: bleak and WinRT have no API for LE L2CAP channels. Both kinds of clients
+  can be connected at the same time, and `--max-clients` counts them together.
+- **The gain is parallel sessions, not speed:** every channel is a session of its own, so a
+  second session from the same computer (a shell next to a large `scp`) shares the link
+  instead of being refused. Throughput is about the same as GATT's; the radio is the limit.
+- **Falls back to GATT** when the server has no channel (an older server, or no `--l2cap`)
+  or the channel can't be opened. Older clients use GATT on a server with `--l2cap`.
+- **`--require-bonding`** applies to channels too: they need an encrypted link from a bonded
+  central.
+
+For the systemd service, add `--l2cap` to `BLE_SSH_OPTS`; the unit allows the Bluetooth
+sockets it needs. Measurements and what is not done yet: [docs/l2cap.md](docs/l2cap.md).
 
 ### Run as a systemd service
 
@@ -339,9 +365,11 @@ Host pi-ble
 ```
 
 Options: `--timeout S` (default 20), `--pair` (bond first, needed once for servers with
-`--require-bonding`), `--reliable` (write-with-response, slower), `--verbose` (progress on
-stderr). `--pair` registers a NoInputNoOutput agent for the duration of the run, so only
-Just Works pairing is supported.
+`--require-bonding`), `--reliable` (write-with-response, slower), `--l2cap` (use the
+server's L2CAP channel if it offers one, else GATT; C client only, see
+[L2CAP channels](#l2cap-channels---l2cap-prototype)), `--verbose` (progress on stderr).
+`--pair` registers a NoInputNoOutput agent for the duration of the run, so only Just Works
+pairing is supported.
 
 ### Files, editors and other tools
 
@@ -416,7 +444,8 @@ Ending a session cleanly matters because the BLE link can outlive the client:
   leave one behind. A link left up anyway (a client killed with `kill -9`) is dropped and
   connected afresh, by name or by address. If another client on the same machine is using the
   link, a new one exits with "in use" instead: BlueZ has one link per device, and the server
-  one session per link.
+  one GATT session per link. With `--l2cap` (C client, server with `--l2cap`) the new client
+  joins the link with a channel of its own instead, and leaves the link up when it exits.
 - **Right after a previous connection**, the next attempt can hit the old link while it is
   still going away (`le-connection-abort-by-local`, `Not Connected`, or Windows' "the object
   has been closed"). Both clients retry until `--timeout`.
@@ -431,9 +460,15 @@ from Windows, with no pause between them.
 | `5f2d0001-8c3b-4a7e-b1d9-2e6f4a9c7b10` | service | | |
 | `5f2d0002-8c3b-4a7e-b1d9-2e6f4a9c7b10` | RX | write, write-without-response | client → sshd |
 | `5f2d0003-8c3b-4a7e-b1d9-2e6f4a9c7b10` | TX | notify | sshd → client |
+| `5f2d0004-8c3b-4a7e-b1d9-2e6f4a9c7b10` | PSM | read (only with `--l2cap`) | the L2CAP channel's PSM, 2 bytes little endian |
 
 A session opens when the client enables notifications on TX and closes when it disables
-them or disconnects. When sshd closes the connection the server drops the BLE link.
+them or disconnects. When sshd closes the connection, the server sends what is still queued
+and ends the session; the BLE link stays up, so the client can start another one.
+
+Over L2CAP, a session is one LE credit-based channel to the PSM: it opens when the server
+accepts the channel and closes when either side closes it. The channel carries the SSH bytes
+as they are, with no framing.
 
 ## License
 

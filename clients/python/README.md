@@ -101,6 +101,11 @@ tkinter ships with Python on Windows and macOS; on Debian/Ubuntu install `python
 | `--progress` | One status line per step on stderr (looking, connecting, connected); `--ssh-config` and the GUI turn it on |
 | `-v, --verbose` | Detailed progress on stderr, with timestamps |
 
+The C client's `--l2cap` (sessions over an L2CAP channel, for servers started with
+`--l2cap`) has no counterpart here: bleak, and Windows itself, have no API for LE L2CAP
+channels. This client always uses GATT, which every server offers, also next to L2CAP; see
+[L2CAP channels](../../README.md#l2cap-channels---l2cap-prototype).
+
 ## Platform notes
 
 - **Windows:** works with Windows' own OpenSSH (`ssh.exe`). Use the full path to

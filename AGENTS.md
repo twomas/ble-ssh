@@ -8,9 +8,10 @@ covers what isn't obvious from them.
 
 | Path | What |
 |------|------|
-| `src/ble_ssh_server.c` | GATT server: one session per TX subscription, bridged to sshd over TCP |
+| `src/ble_ssh_server.c` | GATT server: one session per TX subscription (and with `--l2cap` per L2CAP channel), bridged to sshd over TCP |
 | `src/ble_ssh_client.c` | Linux C client (BlueZ via bluez_inc), used as ssh `ProxyCommand` |
 | `src/ble_ssh.h` | UUIDs and sizes shared by both C programs |
+| `src/ble_ssh_l2cap.h` | LE L2CAP socket definitions and helpers (`--l2cap`), written out so libbluetooth isn't needed |
 | `clients/python/` | Cross-platform client (`ble-ssh-client`) and tkinter GUI (`ble-ssh-gui`), built on bleak |
 | `external/bluez_inc/` | Submodule: our fork of bluez_inc, the BlueZ D-Bus wrapper |
 | `systemd/` | Unit template, `/etc/default` example, sysusers |
@@ -52,7 +53,9 @@ anything that touches BLE has to be tested on real hardware (see below).
   names in code, docs, tests or screenshots: use `AA:BB:CC:DD:EE:FF`, `ssh-server`, `pi`.
   Screenshots show made-up devices.
 - **Keep the clients' command lines in step.** The C and Python clients take the same
-  options for the same things; a new option goes in both READMEs' option tables.
+  options for the same things; a new option goes in both READMEs' option tables. The one
+  exception is `--l2cap`, C client only: bleak and WinRT have no API for LE L2CAP channels.
+  The Python README says so; add it there when bleak can.
 - **Python 3.10+.** Use no newer syntax, and keep `requires-python` and the CI matrix in step.
 - **Versions:** `project.version` in `pyproject.toml`, `__version__` in
   `clients/python/src/ble_ssh_client/__init__.py`, the git tag `vX.Y.Z`, and
@@ -66,6 +69,11 @@ handling. In short:
 
 - A session is exactly one TX subscription. The server connects to sshd on the client's
   **first write**, not on subscribe, because clients subscribe briefly and then resubscribe.
+- An L2CAP session is exactly one channel, connected to sshd at `accept()`. Before closing a
+  channel, wait for the kernel's send queue to empty (`ble_ssh_l2cap_unsent()`): `close()`
+  drops SDUs still waiting for credits. A client on a shared link must ignore TX
+  notifications, which BlueZ also delivers for other processes' GATT sessions. See
+  [docs/l2cap.md](docs/l2cap.md).
 - The Python client toggles TX notifications on → off → on, because Windows reuses a link
   that may still be subscribed. It unsubscribes before disconnecting, with timeouts, because
   WinRT calls can hang while a link goes away.
