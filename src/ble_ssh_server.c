@@ -9,20 +9,30 @@
  * publishes its PSM in a GATT characteristic: clients that can open such a channel use it, and
  * every channel is a session of its own (see ble_ssh_l2cap.h). GATT sessions keep working.
  *
+ * With --pty CMD (prototype) every session runs CMD (normally /bin/login) on a pseudo terminal
+ * of its own instead of connecting to sshd: a serial console over BLE, which any terminal app
+ * can use, e.g. on a phone with --nus. The BLE link is then the only protection, so --pty
+ * needs --require-bonding.
+ *
  * Usage: ble_ssh_server [--port 22] [--host 127.0.0.1] [--name NAME | --adapter-name] [--max-clients 4]
- *                       [--no-advertise] [--no-power-on] [--require-bonding] [--l2cap [--psm N]] [--verbose]
+ *                       [--no-advertise] [--no-power-on] [--require-bonding] [--l2cap [--psm N]]
+ *                       [--pty CMD] [--nus] [--verbose]
  */
 
 #define _GNU_SOURCE // accept4
 
 #include <errno.h>
+#include <fcntl.h>
 #include <glib.h>
 #include <glib-unix.h>
 #include <netdb.h>
+#include <pty.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "adapter.h"
@@ -42,7 +52,8 @@
 
 typedef struct {
     gchar *address;     // central's address, upper case
-    int fd;             // TCP connection to sshd
+    int fd;             // TCP connection to sshd, or the pty's master with --pty
+    GPid pid;           // with --pty: the program on the pty
     guint read_watch;   // fd watch, 0 while paused for back-pressure
     guint retry_source; // pending TX retry timer
     guint16 mtu;
@@ -63,13 +74,23 @@ static gboolean opt_require_bonding = FALSE;
 static gboolean opt_adapter_name = FALSE;
 static gboolean opt_l2cap = FALSE;
 static gint opt_psm = 0;
+static gchar *opt_pty = NULL;
+static gboolean opt_pty_insecure = FALSE;
+static gboolean opt_nus = FALSE;
+static gchar **pty_argv = NULL;
+
+// The tunnel's service and characteristics: ble-ssh's own, or with --nus the Nordic UART Service.
+static const char *svc_uuid = BLE_SSH_SERVICE_UUID;
+static const char *rx_uuid = BLE_SSH_RX_UUID;
+static const char *tx_uuid = BLE_SSH_TX_UUID;
 
 // A session over an L2CAP channel: the channel is the session, so it starts at accept() and
 // ends when either side closes. No GATT involved.
 typedef struct {
     gchar *address;      // central's address, upper case
     int ch;              // the L2CAP channel
-    int fd;              // TCP connection to sshd
+    int fd;              // TCP connection to sshd, or the pty's master with --pty
+    GPid pid;            // with --pty: the program on the pty
     guint ch_watch;      // channel readable
     guint out_watch;     // channel writable again, while to_ch waits for credits
     guint fd_watch;      // sshd readable, 0 while paused for back-pressure
@@ -106,6 +127,7 @@ static void notify_status(void) {
 }
 
 static void session_close(Session *session, const char *reason, gboolean disconnect_central);
+static void session_end(Session *session, const char *reason);
 static void session_flush_tx(Session *session);
 
 static void msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
@@ -147,6 +169,63 @@ static int connect_backend(void) {
     return fd;
 }
 
+// --pty: the program ends; reap it (a session that is still open sees EOF on the master).
+static void on_pty_child_exited(GPid pid, gint status, gpointer user_data) {
+    if (opt_verbose) {
+        if (WIFEXITED(status)) msg("pty program %d exited with %d", (int) pid, WEXITSTATUS(status));
+        else if (WIFSIGNALED(status)) msg("pty program %d ended by signal %d", (int) pid, WTERMSIG(status));
+    }
+    g_spawn_close_pid(pid);
+}
+
+// --pty: start the program on a new pseudo terminal; returns the master, which the session
+// reads and writes like the connection to sshd.
+static int spawn_pty(GPid *pid_out) {
+    struct winsize size = {.ws_row = 24, .ws_col = 80}; // a client has no way to send its own yet
+    int master = -1;
+    const pid_t pid = forkpty(&master, NULL, NULL, &size);
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        // The child: a session of its own with the pty as its controlling terminal (forkpty
+        // did that). Ignored signals stay ignored across exec: SIGPIPE, which the server
+        // ignores, and SIGHUP when it was started with nohup, would leave the program
+        // running after its session ends. Start it with default signals and none blocked.
+        const int defaults[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE, SIGCHLD, SIGTSTP, SIGTTIN, SIGTTOU};
+        for (gsize i = 0; i < G_N_ELEMENTS(defaults); i++) signal(defaults[i], SIG_DFL);
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        setenv("TERM", "vt100", 1); // what serial terminal apps understand
+        execvp(pty_argv[0], pty_argv);
+        fprintf(stderr, "ble_ssh_server: cannot run %s: %s\r\n", pty_argv[0], strerror(errno));
+        _exit(127);
+    }
+    g_unix_set_fd_nonblocking(master, FALSE, NULL);
+    (void) fcntl(master, F_SETFD, FD_CLOEXEC);
+    g_child_watch_add(pid, on_pty_child_exited, NULL);
+    *pid_out = pid;
+    return master;
+}
+
+// The other end of a session: sshd (or --host/--port), or with --pty a new program on a pty.
+static int open_backend(GPid *pid) {
+    *pid = 0;
+    return opt_pty != NULL ? spawn_pty(pid) : connect_backend();
+}
+
+static void close_backend(int fd, GPid pid) {
+    if (fd >= 0) close(fd);
+    // Closing the master hangs the terminal up, which sends SIGHUP to its foreground jobs;
+    // send it to the program's process group as well, in case it ignores the hangup.
+    if (pid > 0) kill(-pid, SIGHUP);
+}
+
+// read() on the backend, with the end of a pty (EIO once the program has exited) as EOF.
+static ssize_t read_backend(int fd, void *buf, size_t len) {
+    const ssize_t n = read(fd, buf, len);
+    return (n < 0 && errno == EIO && opt_pty != NULL) ? 0 : n;
+}
+
 static gboolean write_all(int fd, const guint8 *data, gsize len) {
     while (len > 0) {
         ssize_t n = write(fd, data, len);
@@ -163,7 +242,7 @@ static gboolean write_all(int fd, const guint8 *data, gsize len) {
 static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer user_data) {
     Session *session = user_data;
     guint8 buf[READ_CHUNK];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    ssize_t n = read_backend(fd, buf, sizeof(buf));
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         session->read_watch = 0;
@@ -173,9 +252,7 @@ static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer us
             session->backend_eof = TRUE;
             return G_SOURCE_REMOVE;
         }
-        // Keep the link: SSH ends the session in-band, and the client may reuse the link for
-        // its next connection (Windows does); dropping it here would kill that one.
-        session_close(session, n == 0 ? "backend closed" : g_strerror(errno), FALSE);
+        session_end(session, n == 0 ? "backend closed" : g_strerror(errno)); // keeps the link for SSH
         return G_SOURCE_REMOVE;
     }
     session->bytes_in += (guint64) n;
@@ -207,8 +284,8 @@ static void session_flush_tx(Session *session) {
     while (session->tx->len > 0) {
         const gsize len = MIN(session->tx->len, chunk_size(session));
         GByteArray chunk = {.data = session->tx->data, .len = (guint) len};
-        const int result = binc_application_notify_device(app, session->address, BLE_SSH_SERVICE_UUID,
-                                                          BLE_SSH_TX_UUID, &chunk);
+        const int result = binc_application_notify_device(app, session->address, svc_uuid,
+                                                          tx_uuid, &chunk);
         if (result == 0) {
             g_byte_array_remove_range(session->tx, 0, (guint) len);
             session->bytes_out += len;
@@ -228,7 +305,7 @@ static void session_flush_tx(Session *session) {
         return;
     }
     if (session->backend_eof) {
-        session_close(session, "backend closed", FALSE);
+        session_end(session, "backend closed");
         return;
     }
     session_resume_reading(session);
@@ -256,9 +333,10 @@ static Session *session_open(const char *address, guint16 mtu) {
 
 static gboolean session_connect_backend(Session *session) {
     if (session->fd >= 0) return TRUE;
-    session->fd = connect_backend();
+    session->fd = open_backend(&session->pid);
     if (session->fd < 0) {
-        msg("%s: cannot connect to %s:%d: %s", session->address, opt_host, opt_port, g_strerror(errno));
+        if (opt_pty != NULL) msg("%s: cannot start %s: %s", session->address, opt_pty, g_strerror(errno));
+        else msg("%s: cannot connect to %s:%d: %s", session->address, opt_host, opt_port, g_strerror(errno));
         return FALSE;
     }
     session_resume_reading(session);
@@ -270,7 +348,7 @@ static void session_close(Session *session, const char *reason, gboolean disconn
         session->address, reason, session->bytes_in, session->bytes_out);
     if (session->read_watch != 0) g_source_remove(session->read_watch);
     if (session->retry_source != 0) g_source_remove(session->retry_source);
-    if (session->fd >= 0) close(session->fd);
+    close_backend(session->fd, session->pid);
     if (disconnect_central && adapter != NULL) {
         // The tunnel has no in-band EOF, so dropping the link tells the client we are done.
         Device *device = binc_adapter_get_device_by_address(adapter, session->address);
@@ -296,6 +374,33 @@ static Session *session_lookup(const char *address) {
     return session;
 }
 
+#define PTY_END_DISCONNECT_MS 500 // lets the end marker go out before the link drops
+
+static gboolean on_pty_end_timeout(gpointer data) {
+    gchar *address = data;
+    Device *device = adapter != NULL ? binc_adapter_get_device_by_address(adapter, address) : NULL;
+    if (device != NULL && binc_device_get_connection_state(device) == BINC_CONNECTED && session_lookup(address) == NULL) {
+        binc_device_disconnect(device);
+    }
+    g_free(address);
+    return G_SOURCE_REMOVE;
+}
+
+// The backend ended. SSH ends its session in-band, so keep the link: the client may reuse it
+// for its next connection (Windows does). A program on a pty has no such end, and GATT has no
+// EOF: send the end marker and drop the link, which is how the client learns of it.
+static void session_end(Session *session, const char *reason) {
+    if (opt_pty == NULL) {
+        session_close(session, reason, FALSE);
+        return;
+    }
+    GByteArray marker = {.data = (guint8 *) BLE_SSH_PTY_END_MARKER, .len = sizeof(BLE_SSH_PTY_END_MARKER) - 1};
+    binc_application_notify_device(app, session->address, svc_uuid, tx_uuid, &marker);
+    gchar *address = g_strdup(session->address);
+    session_close(session, reason, FALSE);
+    g_timeout_add(PTY_END_DISCONNECT_MS, on_pty_end_timeout, address);
+}
+
 // With --require-bonding the characteristics already demand an encrypted link, but an
 // encrypted link can also come from a pairing that wasn't stored. Only accept centrals that
 // are bonded, i.e. that the program owning the agent and pairable setting let in for good.
@@ -317,7 +422,7 @@ static void l2_close(L2Session *s, const char *reason) {
     if (s->fd_watch != 0) g_source_remove(s->fd_watch);
     if (s->drain_source != 0) g_source_remove(s->drain_source);
     close(s->ch);
-    if (s->fd >= 0) close(s->fd);
+    close_backend(s->fd, s->pid);
     l2_sessions = g_list_remove(l2_sessions, s);
     g_byte_array_free(s->to_ch, TRUE);
     g_free(s->address);
@@ -328,13 +433,17 @@ static void l2_close(L2Session *s, const char *reason) {
 static gboolean on_l2_backend_readable(gint fd, GIOCondition condition, gpointer user_data) {
     L2Session *s = user_data;
     guint8 buf[READ_CHUNK];
-    ssize_t n = read(fd, buf, sizeof(buf));
+    ssize_t n = read_backend(fd, buf, sizeof(buf));
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         s->fd_watch = 0;
         if (n == 0) {
             // l2_flush() sends what is left, then waits for the kernel to send it, then closes.
             s->backend_eof = TRUE;
+            if (opt_pty != NULL) {
+                g_byte_array_append(s->to_ch, (const guint8 *) BLE_SSH_PTY_END_MARKER,
+                                    sizeof(BLE_SSH_PTY_END_MARKER) - 1);
+            }
             l2_flush(s);
             return G_SOURCE_REMOVE;
         }
@@ -436,9 +545,11 @@ static gboolean on_l2_accept(gint lfd, GIOCondition condition, gpointer user_dat
         close(ch);
         return G_SOURCE_CONTINUE;
     }
-    const int fd = connect_backend();
+    GPid pid = 0;
+    const int fd = open_backend(&pid);
     if (fd < 0) {
-        msg("%s: cannot connect to %s:%d: %s", address, opt_host, opt_port, g_strerror(errno));
+        if (opt_pty != NULL) msg("%s: cannot start %s: %s", address, opt_pty, g_strerror(errno));
+        else msg("%s: cannot connect to %s:%d: %s", address, opt_host, opt_port, g_strerror(errno));
         close(ch);
         return G_SOURCE_CONTINUE;
     }
@@ -446,6 +557,7 @@ static gboolean on_l2_accept(gint lfd, GIOCondition condition, gpointer user_dat
     s->address = g_strdup(address);
     s->ch = ch;
     s->fd = fd;
+    s->pid = pid;
     s->sndmtu = ble_ssh_l2cap_sndmtu(ch);
     s->to_ch = g_byte_array_new();
     s->ch_watch = g_unix_fd_add(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_channel_readable, s);
@@ -521,7 +633,7 @@ static gboolean on_bond_wait(gpointer data) {
 
 static void on_notify_state(const Application *application, const char *address, const char *service_uuid,
                             const char *char_uuid, gboolean notifying, guint16 mtu) {
-    if (!g_str_equal(char_uuid, BLE_SSH_TX_UUID)) return;
+    if (!g_str_equal(char_uuid, tx_uuid)) return;
     Session *session = session_lookup(address);
     if (notifying) {
         if (session != NULL) session_close(session, "client restarted notifications", FALSE);
@@ -541,7 +653,7 @@ static void on_notify_state(const Application *application, const char *address,
 static const char *on_char_write(const Application *application, const char *address, const char *service_uuid,
                                  const char *char_uuid, GByteArray *byteArray, const guint16 mtu,
                                  const guint16 offset) {
-    if (!g_str_equal(char_uuid, BLE_SSH_RX_UUID)) return BLUEZ_ERROR_REJECTED;
+    if (!g_str_equal(char_uuid, rx_uuid)) return BLUEZ_ERROR_REJECTED;
     Session *session = session_lookup(address);
     if (session == NULL) {
         // A session is exactly one TX subscription (notifications on -> off). Never start one
@@ -600,11 +712,11 @@ static void on_central_state_changed(Adapter *a, Device *device) {
 }
 
 static void add_char(const char *uuid, guint flags, const char *description) {
-    binc_application_add_characteristic(app, BLE_SSH_SERVICE_UUID, uuid, flags);
-    binc_application_add_descriptor(app, BLE_SSH_SERVICE_UUID, uuid, BLE_SSH_CUD_UUID, GATT_CHR_PROP_READ);
+    binc_application_add_characteristic(app, svc_uuid, uuid, flags);
+    binc_application_add_descriptor(app, svc_uuid, uuid, BLE_SSH_CUD_UUID, GATT_CHR_PROP_READ);
     GByteArray *value = g_byte_array_new();
     g_byte_array_append(value, (const guint8 *) description, (guint) strlen(description));
-    binc_application_set_desc_value(app, BLE_SSH_SERVICE_UUID, uuid, BLE_SSH_CUD_UUID, value);
+    binc_application_set_desc_value(app, svc_uuid, uuid, BLE_SSH_CUD_UUID, value);
     g_byte_array_free(value, TRUE);
 }
 
@@ -648,6 +760,14 @@ int main(int argc, char **argv) {
          "Also accept sessions over LE L2CAP channels (clients that can use them do)", NULL},
         {"psm", 0, 0, G_OPTION_ARG_INT, &opt_psm, "With --l2cap: the PSM, 128-255 (default: the kernel picks one)",
          "N"},
+        {"pty", 0, 0, G_OPTION_ARG_STRING, &opt_pty,
+         "Run CMD (e.g. /bin/login) on a pseudo terminal per session instead of connecting to sshd; "
+         "needs --require-bonding",
+         "CMD"},
+        {"pty-insecure", 0, 0, G_OPTION_ARG_NONE, &opt_pty_insecure,
+         "Allow --pty without --require-bonding: anyone in range gets CMD. Only for a bench test", NULL},
+        {"nus", 0, 0, G_OPTION_ARG_NONE, &opt_nus,
+         "Offer the Nordic UART Service instead of ble-ssh's, for terminal apps (with --pty)", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Verbose logging, including bluez_inc", NULL},
         {NULL}};
     GError *error = NULL;
@@ -669,6 +789,32 @@ int main(int argc, char **argv) {
         msg("--psm must be between 128 and 255 (LE dynamic range)");
         return 2;
     }
+    if (opt_pty != NULL) {
+        if (!g_shell_parse_argv(opt_pty, NULL, &pty_argv, &error)) {
+            msg("--pty: %s", error->message);
+            return 2;
+        }
+        // Without SSH, the BLE link's encryption is all there is: only bonded centrals on
+        // encrypted links may reach a login prompt.
+        if (!opt_require_bonding && !opt_pty_insecure) {
+            msg("--pty needs --require-bonding: without SSH the BLE link is the only protection "
+                "(--pty-insecure overrides this for a bench test)");
+            return 2;
+        }
+        if (!opt_require_bonding) {
+            msg("WARNING: --pty-insecure: anyone in Bluetooth range gets '%s', unencrypted", opt_pty);
+        }
+    } else if (opt_pty_insecure) {
+        msg("--pty-insecure only goes with --pty");
+        return 2;
+    }
+    if (opt_nus) {
+        svc_uuid = BLE_SSH_NUS_SERVICE_UUID;
+        rx_uuid = BLE_SSH_NUS_RX_UUID;
+        tx_uuid = BLE_SSH_NUS_TX_UUID;
+    }
+    gchar *backend = opt_pty != NULL ? g_strdup_printf("'%s' on a pty", opt_pty)
+                                     : g_strdup_printf("%s:%d", opt_host, opt_port);
 
     log_enabled(opt_verbose);
     log_set_level(LOG_DEBUG);
@@ -714,18 +860,18 @@ int main(int argc, char **argv) {
     sessions = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, session_free);
 
     app = binc_create_application(adapter);
-    binc_application_add_service(app, BLE_SSH_SERVICE_UUID);
+    binc_application_add_service(app, svc_uuid);
     const guint rx_security = opt_require_bonding ? GATT_CHR_PROP_ENCRYPT_WRITE : 0;
     const guint tx_security = opt_require_bonding ? GATT_CHR_PROP_ENCRYPT_NOTIFY : 0;
-    add_char(BLE_SSH_RX_UUID, GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP | rx_security, "ssh rx");
-    add_char(BLE_SSH_TX_UUID, GATT_CHR_PROP_NOTIFY | tx_security, "ssh tx");
+    add_char(rx_uuid, GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP | rx_security, "ssh rx");
+    add_char(tx_uuid, GATT_CHR_PROP_NOTIFY | tx_security, "ssh tx");
     if (opt_l2cap) {
         if (!l2_listen()) return 1;
         add_char(BLE_SSH_PSM_UUID, GATT_CHR_PROP_READ, "l2cap psm");
         const guint8 psm[2] = {(guint8) (l2_psm & 0xff), (guint8) (l2_psm >> 8)};
         GByteArray *value = g_byte_array_new();
         g_byte_array_append(value, psm, sizeof(psm));
-        binc_application_set_char_value(app, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID, value);
+        binc_application_set_char_value(app, svc_uuid, BLE_SSH_PSM_UUID, value);
         g_byte_array_free(value, TRUE);
         msg("L2CAP channels on PSM 0x%02x%s", l2_psm, opt_require_bonding ? " (encrypted links only)" : "");
     }
@@ -737,20 +883,21 @@ int main(int argc, char **argv) {
     if (opt_no_advertise) {
         // GATT services are shared by everything registered on the adapter, so a central that
         // connects through another program's advertisement still finds this service.
-        msg("GATT service registered on %s without advertising, forwarding to %s:%d, max %d clients",
-            binc_adapter_get_address(adapter), opt_host, opt_port, opt_max_clients);
+        msg("GATT service%s registered on %s without advertising, forwarding to %s, max %d clients",
+            opt_nus ? " (Nordic UART)" : "", binc_adapter_get_address(adapter), backend, opt_max_clients);
     } else {
         GPtrArray *uuids = g_ptr_array_new();
-        g_ptr_array_add(uuids, BLE_SSH_SERVICE_UUID);
+        g_ptr_array_add(uuids, (gpointer) svc_uuid);
         advertisement = binc_advertisement_create();
         binc_advertisement_set_local_name(advertisement, opt_name);
         binc_advertisement_set_services(advertisement, uuids);
         binc_advertisement_set_interval(advertisement, 100, 300);
         binc_adapter_start_advertising(adapter, advertisement);
         g_ptr_array_free(uuids, TRUE);
-        msg("advertising '%s' on %s, forwarding to %s:%d, max %d clients", opt_name,
-            binc_adapter_get_address(adapter), opt_host, opt_port, opt_max_clients);
+        msg("advertising '%s'%s on %s, forwarding to %s, max %d clients", opt_name,
+            opt_nus ? " (Nordic UART)" : "", binc_adapter_get_address(adapter), backend, opt_max_clients);
     }
+    g_free(backend);
 
     const guint bluez_watch = g_bus_watch_name_on_connection(connection, "org.bluez", G_BUS_NAME_WATCHER_FLAGS_NONE,
                                                              NULL, on_bluez_vanished, NULL, NULL);
@@ -783,5 +930,7 @@ int main(int argc, char **argv) {
     g_object_unref(connection);
     g_free(opt_host);
     g_free(opt_name);
+    g_free(opt_pty);
+    g_strfreev(pty_argv);
     return exit_code;
 }

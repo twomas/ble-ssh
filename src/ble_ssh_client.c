@@ -63,6 +63,33 @@ static guint linked_wait_source = 0;
 static guint restart_source = 0;
 static gboolean linked = FALSE; // we had a link to device, so BlueZ may have read its GAP name
 static gboolean opt_l2cap = FALSE;
+static gboolean opt_nus = FALSE;
+
+// The last bytes the server sent, to tell a --pty server's end of session (its end marker,
+// then a dropped link) from a link that drops.
+#define END_MARKER_LEN (sizeof(BLE_SSH_PTY_END_MARKER) - 1)
+static guint8 tail[END_MARKER_LEN];
+static gsize tail_len = 0;
+
+static void remember_tail(const guint8 *data, gsize len) {
+    if (len >= END_MARKER_LEN) {
+        memcpy(tail, data + len - END_MARKER_LEN, END_MARKER_LEN);
+        tail_len = END_MARKER_LEN;
+        return;
+    }
+    const gsize keep = MIN(tail_len, END_MARKER_LEN - len);
+    memmove(tail, tail + tail_len - keep, keep);
+    memcpy(tail + keep, data, len);
+    tail_len = keep + len;
+}
+
+static gboolean server_ended_session(void) {
+    return tail_len == END_MARKER_LEN && memcmp(tail, BLE_SSH_PTY_END_MARKER, END_MARKER_LEN) == 0;
+}
+// The tunnel's service and characteristics: ble-ssh's own, or with --nus the Nordic UART Service.
+static const char *svc_uuid = BLE_SSH_SERVICE_UUID;
+static const char *rx_uuid = BLE_SSH_RX_UUID;
+static const char *tx_uuid = BLE_SSH_TX_UUID;
 static int l2_fd = -1;           // the L2CAP channel, while connecting or up
 static guint l2_watch = 0;       // connect completion, then channel readable
 static guint l2_out_watch = 0;   // channel writable again, while outq waits for credits
@@ -110,7 +137,7 @@ static void disconnect_and_quit(int code) {
     }
     quitting = TRUE;
     // Unsubscribing is what ends the session on the server, even if the link lingers.
-    if (tunnel_up && !via_l2cap) binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    if (tunnel_up && !via_l2cap) binc_device_stop_notify(device, svc_uuid, tx_uuid);
     binc_device_disconnect(device); // a connect still in progress is dropped once it completes
     if (quit_source == 0) quit_source = g_timeout_add(QUIT_GRACE_MS, on_quit_grace, NULL);
 }
@@ -254,7 +281,7 @@ static gboolean on_l2_readable(gint fd, GIOCondition condition, gpointer user_da
 }
 
 static void start_gatt(void) {
-    binc_device_start_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    binc_device_start_notify(device, svc_uuid, tx_uuid);
 }
 
 static gboolean on_l2_connected(gint fd, GIOCondition condition, gpointer user_data) {
@@ -324,8 +351,8 @@ static void on_read_char(Device *d, Characteristic *characteristic, const GByteA
 
 // Open the tunnel: over an L2CAP channel when asked for and offered, else over GATT.
 static void start_tunnel(void) {
-    if (opt_l2cap && binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID) != NULL) {
-        if (binc_device_read_char(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID)) return;
+    if (opt_l2cap && binc_device_get_characteristic(device, svc_uuid, BLE_SSH_PSM_UUID) != NULL) {
+        if (binc_device_read_char(device, svc_uuid, BLE_SSH_PSM_UUID)) return;
         debug("reading the server's L2CAP PSM failed, using GATT");
     } else if (opt_l2cap) {
         debug("the server offers no L2CAP channel, using GATT");
@@ -345,7 +372,7 @@ static void pump_writes(void) {
         if (stdin_eof) {
             debug("stdin closed, disconnecting");
             // Unsubscribing is what ends the session on the server, even if the link lingers.
-            binc_device_stop_notify(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+            binc_device_stop_notify(device, svc_uuid, tx_uuid);
             binc_device_disconnect(device);
         }
         return;
@@ -354,7 +381,7 @@ static void pump_writes(void) {
     GByteArray *chunk = g_byte_array_sized_new((guint) len);
     g_byte_array_append(chunk, outq->data, (guint) len);
     // Only one write is outstanding at a time; its completion callback sends the next.
-    if (binc_device_write_char(device, BLE_SSH_SERVICE_UUID, BLE_SSH_RX_UUID, chunk,
+    if (binc_device_write_char(device, svc_uuid, rx_uuid, chunk,
                                opt_reliable ? WITH_RESPONSE : WITHOUT_RESPONSE)) {
         write_in_flight = TRUE;
         g_byte_array_remove_range(outq, 0, (guint) len);
@@ -402,10 +429,11 @@ static void start_stdin_watch(void) {
 }
 
 static void on_notify(Device *d, Characteristic *characteristic, const GByteArray *byteArray) {
-    if (!g_str_equal(binc_characteristic_get_uuid(characteristic), BLE_SSH_TX_UUID)) return;
+    if (!g_str_equal(binc_characteristic_get_uuid(characteristic), tx_uuid)) return;
     // BlueZ signals TX's value to every process watching the device: on a shared link these
     // are another client's GATT session (only ours when we subscribed ourselves).
     if (via_l2cap || l2_fd >= 0 || joined_link || !tunnel_up) return;
+    remember_tail(byteArray->data, byteArray->len);
     const guint8 *data = byteArray->data;
     gsize len = byteArray->len;
     while (len > 0) {
@@ -447,9 +475,9 @@ static void on_services_resolved(Device *d) {
         handle_linked();
         return;
     }
-    if (!binc_device_has_service(device, BLE_SSH_SERVICE_UUID)) {
-        msg("%s does not offer the ble-ssh service (is ble_ssh_server running there?)",
-            binc_device_get_address(device));
+    if (!binc_device_has_service(device, svc_uuid)) {
+        msg("%s does not offer the %s service (is ble_ssh_server%s running there?)",
+            binc_device_get_address(device), opt_nus ? "Nordic UART" : "ble-ssh", opt_nus ? " --nus" : "");
         giving_up = TRUE;
         binc_device_disconnect(device);
         return;
@@ -528,7 +556,9 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
         schedule_reconnect(RECONNECT_MS);
         return;
     }
-    if (state == BINC_DISCONNECTED && tunnel_up && !stdin_eof) {
+    if (state == BINC_DISCONNECTED && tunnel_up && !stdin_eof && server_ended_session()) {
+        debug("the server ended the session");
+    } else if (state == BINC_DISCONNECTED && tunnel_up && !stdin_eof) {
         // ssh still had the session open, and the server keeps the link when a session ends,
         // so this is a drop: what was in flight is lost. The usual cause is a server without
         // ReverseServiceDiscovery = false, whose bluetoothd reads our own GATT services (some
@@ -547,14 +577,14 @@ static void handle_linked(void) {
         g_source_remove(linked_wait_source);
         linked_wait_source = 0;
     }
-    if (opt_l2cap && binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_PSM_UUID) != NULL) {
+    if (opt_l2cap && binc_device_get_characteristic(device, svc_uuid, BLE_SSH_PSM_UUID) != NULL) {
         // L2CAP channels share the link, each its own session: join it instead of dropping it.
         debug("joining the link to %s that is already up", binc_device_get_address(device));
         joined_link = TRUE;
         start_tunnel();
         return;
     }
-    Characteristic *tx = binc_device_get_characteristic(device, BLE_SSH_SERVICE_UUID, BLE_SSH_TX_UUID);
+    Characteristic *tx = binc_device_get_characteristic(device, svc_uuid, tx_uuid);
     if (tx != NULL && binc_characteristic_is_notifying(tx)) {
         // BlueZ has one link per device, and the server one session per link.
         msg("the link to %s is in use by another client on this machine", binc_device_get_address(device));
@@ -745,6 +775,8 @@ int main(int argc, char **argv) {
          "Bond with the server first (needed for servers started with --require-bonding)", NULL},
         {"l2cap", 'L', 0, G_OPTION_ARG_NONE, &opt_l2cap,
          "Use the server's L2CAP channel if it offers one (ble_ssh_server --l2cap), else GATT", NULL},
+        {"nus", 0, 0, G_OPTION_ARG_NONE, &opt_nus,
+         "Talk to a server started with --nus (Nordic UART Service instead of ble-ssh's)", NULL},
         {"verbose", 'v', 0, G_OPTION_ARG_NONE, &opt_verbose, "Print progress to stderr", NULL},
         {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_target, NULL, "ADDRESS|NAME"},
         {NULL}};
@@ -757,6 +789,11 @@ int main(int argc, char **argv) {
     }
     g_option_context_free(context);
     target = opt_target[0];
+    if (opt_nus) {
+        svc_uuid = BLE_SSH_NUS_SERVICE_UUID;
+        rx_uuid = BLE_SSH_NUS_RX_UUID;
+        tx_uuid = BLE_SSH_NUS_TX_UUID;
+    }
 
     // bluez_inc logs to stdout, which is our data channel: route it to stderr instead.
     log_set_handler(&on_binc_log);

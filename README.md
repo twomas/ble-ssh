@@ -51,7 +51,7 @@ Try it in the foreground first:
 ./build/ble_ssh_server            # advertises as ssh-<hostname>, forwards to 127.0.0.1:22
 ./build/ble_ssh_server --help     # --port, --host, --name, --adapter-name, --max-clients,
                                   # --no-advertise, --no-power-on, --require-bonding,
-                                  # --l2cap, --psm, --verbose
+                                  # --l2cap, --psm, --pty, --nus, --verbose
 ```
 
 To advertise under the name the device already has, use `--adapter-name`: the server
@@ -136,6 +136,23 @@ ssh -o ProxyCommand="ble_ssh_client --l2cap ssh-raspberrypi" pi@raspberrypi
 
 For the systemd service, add `--l2cap` to `BLE_SSH_OPTS`; the unit allows the Bluetooth
 sockets it needs. Measurements and what is not done yet: [docs/l2cap.md](docs/l2cap.md).
+
+### Console on a pty (`--pty`, prototype)
+
+With `--pty CMD` every session runs CMD, normally `/bin/login`, on a pseudo terminal of its
+own instead of connecting to sshd: a serial console over BLE, for when the network, sshd or
+the keys are broken. With `--nus` the server offers the Nordic UART Service instead of
+ble-ssh's, so terminal apps on a phone can use it.
+
+```bash
+sudo ./build/ble_ssh_server --pty /bin/login --require-bonding --nus
+ble_ssh_client --nus ssh-raspberrypi      # or a NUS terminal app
+```
+
+Without SSH the BLE link is the only protection, so `--pty` needs `--require-bonding`; the
+server refuses to start without it. When CMD exits, the client sees
+`[ble-ssh: session ended]` and the link drops (GATT) or the channel closes (L2CAP). Details,
+tests and what is not done yet: [docs/pty.md](docs/pty.md).
 
 ### Run as a systemd service
 
@@ -370,7 +387,9 @@ Host pi-ble
 Options: `--timeout S` (default 20), `--pair` (bond first, needed once for servers with
 `--require-bonding`), `--reliable` (write-with-response, slower), `--l2cap` (use the
 server's L2CAP channel if it offers one, else GATT; C client only, see
-[L2CAP channels](#l2cap-channels---l2cap-prototype)), `--verbose` (progress on stderr).
+[L2CAP channels](#l2cap-channels---l2cap-prototype)), `--nus` (for a server started with
+`--nus`; C client only, see [Console on a pty](#console-on-a-pty---pty-prototype)),
+`--verbose` (progress on stderr).
 `--pair` registers a NoInputNoOutput agent for the duration of the run, so only Just Works
 pairing is supported.
 
@@ -472,6 +491,11 @@ and ends the session; the BLE link stays up, so the client can start another one
 Over L2CAP, a session is one LE credit-based channel to the PSM: it opens when the server
 accepts the channel and closes when either side closes it. The channel carries the SSH bytes
 as they are, with no framing.
+
+With `--nus` the service and RX/TX are the Nordic UART Service's
+(`6e400001`/`6e400002`/`6e400003-b5a3-f393-e0a9-e50e24dcca9e`), with the same roles. With
+`--pty` the bytes are a terminal's; when the program exits, the server sends
+`\r\n[ble-ssh: session ended]\r\n` before it drops the link or closes the channel.
 
 ## License
 
