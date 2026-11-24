@@ -25,6 +25,10 @@ ble_ssh_client --nus ssh-server                             # or a NUS terminal 
 - **When the client goes away**, the server closes the master and sends SIGHUP to CMD's
   process group, so nothing is left running. CMD starts with default signal handling,
   whatever the server inherited (e.g. `nohup`).
+- **login's vhangup:** login revokes the terminal before it asks for the password, and until
+  it has opened it again the master reads EIO. While CMD is still running the server takes
+  that for a hangup, not the end, and reads again after 100 ms; once CMD has exited, EIO is
+  the end of the session.
 
 ## Security
 
@@ -40,9 +44,9 @@ password goes through it. So:
 
 ## Tested
 
-Between two Raspberry Pi 5 (server: Ubuntu 26.04, run as a normal user with `/bin/sh` and
-`--pty-insecure`, because the two aren't bonded and the tests can't type a password;
-client: Debian 13):
+Between two Raspberry Pi 5 (server: Ubuntu 26.04; client: Debian 13). Most tests ran the
+server as a normal user with `/bin/sh` and `--pty-insecure`; the login tests ran it as root
+with `--require-bonding` and the client bonded (`ble_ssh_client --pair`):
 
 | Test | Result |
 |------|--------|
@@ -55,11 +59,13 @@ client: Debian 13):
 | 20 sessions | fds 8 before and after, memory flat, no children or zombies left |
 | `--require-bonding`, unbonded client | Refused over GATT and L2CAP, no program started |
 | `--pty` without `--require-bonding` | Server refuses to start |
+| Bonded, `--pty "/bin/login -f USER"`, GATT and L2CAP | Login shell (`-bash`) for the user on `/dev/pts/N`, parent `login`; `logout` ends the session with the marker, login exits with 0 |
+| Bonded, `--pty /bin/login` | `login:` prompt shown; the client closing at the prompt ends login by SIGHUP |
 
 ## Not done
 
-- **A bonded client with `/bin/login`:** not tested (the test Pis aren't bonded, and a
-  password can't be typed by the tests). Nor a phone app.
+- **A password typed at `/bin/login`:** the tests can't type one; `/bin/login -f USER`
+  (no password) was tested instead, and the prompt of plain `/bin/login`. Nor a phone app.
 - **Window size:** fixed at 24×80. A client could send its size on an extra characteristic,
   which terminal apps wouldn't use.
 - **A systemd unit** for the console mode, running as root with a sandbox that still allows

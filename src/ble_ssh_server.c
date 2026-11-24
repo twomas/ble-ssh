@@ -56,6 +56,7 @@ typedef struct {
     GPid pid;           // with --pty: the program on the pty
     guint read_watch;   // fd watch, 0 while paused for back-pressure
     guint retry_source; // pending TX retry timer
+    guint hangup_retry; // --pty: reading again after a passing hangup (login's vhangup)
     guint16 mtu;
     GByteArray *tx;     // bytes from sshd not yet notified to the central
     gboolean backend_eof; // sshd closed: end the session once tx is sent
@@ -99,6 +100,7 @@ typedef struct {
     gboolean backend_eof; // sshd closed: end the session once to_ch is sent
     guint drain_source;  // after backend_eof: waiting for the kernel to send its queue
     guint drain_tries;
+    guint hangup_retry;  // --pty: reading again after a passing hangup (login's vhangup)
     guint64 bytes_in;
     guint64 bytes_out;
 } L2Session;
@@ -129,6 +131,7 @@ static void notify_status(void) {
 static void session_close(Session *session, const char *reason, gboolean disconnect_central);
 static void session_end(Session *session, const char *reason);
 static void session_flush_tx(Session *session);
+static gboolean on_hangup_retry(gpointer user_data);
 
 static void msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 
@@ -169,8 +172,15 @@ static int connect_backend(void) {
     return fd;
 }
 
+static GHashTable *pty_children = NULL; // --pty: the programs still running (GPid)
+
+static gboolean pty_child_running(GPid pid) {
+    return pid > 0 && pty_children != NULL && g_hash_table_contains(pty_children, GINT_TO_POINTER(pid));
+}
+
 // --pty: the program ends; reap it (a session that is still open sees EOF on the master).
 static void on_pty_child_exited(GPid pid, gint status, gpointer user_data) {
+    if (pty_children != NULL) g_hash_table_remove(pty_children, GINT_TO_POINTER(pid));
     if (opt_verbose) {
         if (WIFEXITED(status)) msg("pty program %d exited with %d", (int) pid, WEXITSTATUS(status));
         else if (WIFSIGNALED(status)) msg("pty program %d ended by signal %d", (int) pid, WTERMSIG(status));
@@ -202,6 +212,8 @@ static int spawn_pty(GPid *pid_out) {
     }
     g_unix_set_fd_nonblocking(master, FALSE, NULL);
     (void) fcntl(master, F_SETFD, FD_CLOEXEC);
+    if (pty_children == NULL) pty_children = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_hash_table_add(pty_children, GINT_TO_POINTER(pid));
     g_child_watch_add(pid, on_pty_child_exited, NULL);
     *pid_out = pid;
     return master;
@@ -220,10 +232,16 @@ static void close_backend(int fd, GPid pid) {
     if (pid > 0) kill(-pid, SIGHUP);
 }
 
-// read() on the backend, with the end of a pty (EIO once the program has exited) as EOF.
-static ssize_t read_backend(int fd, void *buf, size_t len) {
+#define PTY_HANGUP -2           // read_backend(): the pty is hung up, but its program runs on
+#define PTY_HANGUP_RETRY_MS 100
+
+// read() on the backend. A pty's master reads EIO while no one has the terminal open: once
+// the program has exited (EOF), but also for a moment when login calls vhangup() on it and
+// opens it again; then the caller should try again a little later.
+static ssize_t read_backend(int fd, void *buf, size_t len, GPid pid) {
     const ssize_t n = read(fd, buf, len);
-    return (n < 0 && errno == EIO && opt_pty != NULL) ? 0 : n;
+    if (n < 0 && errno == EIO && opt_pty != NULL) return pty_child_running(pid) ? PTY_HANGUP : 0;
+    return n;
 }
 
 static gboolean write_all(int fd, const guint8 *data, gsize len) {
@@ -242,7 +260,13 @@ static gboolean write_all(int fd, const guint8 *data, gsize len) {
 static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer user_data) {
     Session *session = user_data;
     guint8 buf[READ_CHUNK];
-    ssize_t n = read_backend(fd, buf, sizeof(buf));
+    ssize_t n = read_backend(fd, buf, sizeof(buf), session->pid);
+    if (n == PTY_HANGUP) {
+        // Reading again at once would spin: the hung up master stays readable.
+        session->read_watch = 0;
+        session->hangup_retry = g_timeout_add(PTY_HANGUP_RETRY_MS, on_hangup_retry, session);
+        return G_SOURCE_REMOVE;
+    }
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         session->read_watch = 0;
@@ -268,9 +292,17 @@ static gboolean on_backend_readable(gint fd, GIOCondition condition, gpointer us
 }
 
 static void session_resume_reading(Session *session) {
-    if (session->read_watch == 0 && session->fd >= 0 && !session->backend_eof && session->tx->len < TX_LOW_WATER) {
+    if (session->read_watch == 0 && session->hangup_retry == 0 && session->fd >= 0 && !session->backend_eof &&
+        session->tx->len < TX_LOW_WATER) {
         session->read_watch = g_unix_fd_add(session->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_backend_readable, session);
     }
+}
+
+static gboolean on_hangup_retry(gpointer user_data) {
+    Session *session = user_data;
+    session->hangup_retry = 0;
+    session_resume_reading(session);
+    return G_SOURCE_REMOVE;
 }
 
 static gboolean on_tx_retry(gpointer user_data) {
@@ -348,6 +380,7 @@ static void session_close(Session *session, const char *reason, gboolean disconn
         session->address, reason, session->bytes_in, session->bytes_out);
     if (session->read_watch != 0) g_source_remove(session->read_watch);
     if (session->retry_source != 0) g_source_remove(session->retry_source);
+    if (session->hangup_retry != 0) g_source_remove(session->hangup_retry);
     close_backend(session->fd, session->pid);
     if (disconnect_central && adapter != NULL) {
         // The tunnel has no in-band EOF, so dropping the link tells the client we are done.
@@ -414,6 +447,13 @@ static gboolean central_is_bonded(const char *address) {
 
 static gboolean l2_flush(L2Session *s);
 
+static gboolean on_l2_hangup_retry(gpointer user_data) {
+    L2Session *s = user_data;
+    s->hangup_retry = 0;
+    l2_flush(s); // reads again from the pty
+    return G_SOURCE_REMOVE;
+}
+
 static void l2_close(L2Session *s, const char *reason) {
     msg("%s: L2CAP session closed (%s), %" G_GUINT64_FORMAT " bytes in, %" G_GUINT64_FORMAT " bytes out", s->address,
         reason, s->bytes_in, s->bytes_out);
@@ -421,6 +461,7 @@ static void l2_close(L2Session *s, const char *reason) {
     if (s->out_watch != 0) g_source_remove(s->out_watch);
     if (s->fd_watch != 0) g_source_remove(s->fd_watch);
     if (s->drain_source != 0) g_source_remove(s->drain_source);
+    if (s->hangup_retry != 0) g_source_remove(s->hangup_retry);
     close(s->ch);
     close_backend(s->fd, s->pid);
     l2_sessions = g_list_remove(l2_sessions, s);
@@ -433,7 +474,12 @@ static void l2_close(L2Session *s, const char *reason) {
 static gboolean on_l2_backend_readable(gint fd, GIOCondition condition, gpointer user_data) {
     L2Session *s = user_data;
     guint8 buf[READ_CHUNK];
-    ssize_t n = read_backend(fd, buf, sizeof(buf));
+    ssize_t n = read_backend(fd, buf, sizeof(buf), s->pid);
+    if (n == PTY_HANGUP) {
+        s->fd_watch = 0;
+        s->hangup_retry = g_timeout_add(PTY_HANGUP_RETRY_MS, on_l2_hangup_retry, s);
+        return G_SOURCE_REMOVE;
+    }
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
     if (n <= 0) {
         s->fd_watch = 0;
@@ -498,7 +544,7 @@ static gboolean l2_flush(L2Session *s) {
         if (s->drain_source == 0) s->drain_source = g_timeout_add(BLE_SSH_L2CAP_DRAIN_MS, on_l2_drain, s);
         return TRUE;
     }
-    if (s->fd_watch == 0 && s->to_ch->len < TX_LOW_WATER) {
+    if (s->fd_watch == 0 && s->hangup_retry == 0 && s->to_ch->len < TX_LOW_WATER) {
         s->fd_watch = g_unix_fd_add(s->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_backend_readable, s);
     }
     return TRUE;
