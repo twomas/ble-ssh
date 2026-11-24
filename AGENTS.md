@@ -53,8 +53,9 @@ anything that touches BLE has to be tested on real hardware (see below).
   names in code, docs, tests or screenshots: use `AA:BB:CC:DD:EE:FF`, `ssh-server`, `pi`.
   Screenshots show made-up devices.
 - **Keep the clients' command lines in step.** The C and Python clients take the same
-  options for the same things; a new option goes in both READMEs' option tables. The one
-  exception is `--l2cap`, C client only: bleak and WinRT have no API for LE L2CAP channels.
+  options for the same things; a new option goes in both READMEs' option tables. The
+  exceptions are `--l2cap`, C client only because bleak and WinRT have no API for LE L2CAP
+  channels, and the prototype `--nus`, so far only in the C client.
   The Python README says so; add it there when bleak can.
 - **Python 3.10+.** Use no newer syntax, and keep `requires-python` and the CI matrix in step.
 - **Versions:** `project.version` in `pyproject.toml`, `__version__` in
@@ -69,6 +70,11 @@ handling. In short:
 
 - A session is exactly one TX subscription. The server connects to sshd on the client's
   **first write**, not on subscribe, because clients subscribe briefly and then resubscribe.
+- With `--pty` the backend is a program on a pty of its own (`open_backend()`), never a
+  shell for anyone in range: the server refuses `--pty` without `--require-bonding`. Its
+  child gets default signals before `exec`, so it ends with its session even under `nohup`.
+  GATT has no EOF, so the end of a pty session is `BLE_SSH_PTY_END_MARKER` and then a
+  dropped link; both clients recognise the marker. See [docs/pty.md](docs/pty.md).
 - An L2CAP session is exactly one channel, connected to sshd at `accept()`. Before closing a
   channel, wait for the kernel's send queue to empty (`ble_ssh_l2cap_unsent()`): `close()`
   drops SDUs still waiting for credits. A client on a shared link must ignore TX

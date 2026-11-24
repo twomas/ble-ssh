@@ -30,6 +30,8 @@ MIN_CHUNK = 20
 MAX_CHUNK = 512
 READ_CHUNK = 4096
 STDIN_QUEUE_DEPTH = 16  # x READ_CHUNK bytes buffered before stdin reads block
+# What a --pty server sends right before it drops the link at the end of a session (ble_ssh.h).
+PTY_END_MARKER = b"\r\n[ble-ssh: session ended]\r\n"
 # Same text as the C client's: the usual cause is a server without ReverseServiceDiscovery = false,
 # whose bluetoothd reads this computer's own GATT services (Windows 11 has one that needs
 # pairing), fails to pair and drops the link a few seconds in.
@@ -293,7 +295,11 @@ async def run(args: argparse.Namespace) -> int:
 
         for sig in (signal.SIGHUP, signal.SIGTERM):
             loop.add_signal_handler(sig, end_session)
+    tail = bytearray()  # the last bytes received, to recognise a --pty server's end marker
+
     def on_notify(_: object, data: bytearray) -> None:
+        tail.extend(data)
+        del tail[:-len(PTY_END_MARKER)]
         try:
             write_stdout(bytes(data))
         except OSError:  # ssh went away
@@ -326,9 +332,12 @@ async def run(args: argparse.Namespace) -> int:
             log(f"write failed: {pump_task.exception()}")
             return 255
         if link_task in done and pump_task not in done and not ending:
-            # ssh still had the session open (our stdin), and the server keeps the link when a
-            # session ends, so this is a drop: what was in flight is lost.
-            log(LINK_DROPPED)
+            if bytes(tail) == PTY_END_MARKER:
+                debug("the server ended the session")  # a --pty server: marker, then dropped link
+            else:
+                # ssh still had the session open (our stdin), and the server keeps the link when a
+                # session ends, so this is a drop: what was in flight is lost.
+                log(LINK_DROPPED)
         return 0
     except (BleakError, OSError) as error:
         log(str(error))
