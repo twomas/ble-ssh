@@ -321,6 +321,15 @@ static void on_connection_state(Device *d, ConnectionState state, const GError *
         schedule_reconnect(RECONNECT_MS);
         return;
     }
+    if (state == BINC_DISCONNECTED && tunnel_up && !stdin_eof) {
+        // ssh still had the session open, and the server keeps the link when a session ends,
+        // so this is a drop: what was in flight is lost. The usual cause is a server without
+        // ReverseServiceDiscovery = false, whose bluetoothd reads our own GATT services (some
+        // need pairing), fails to pair and drops the link a few seconds in. Same text as the
+        // Python client's.
+        msg("the link dropped while the session was open; if this happens a few seconds after "
+            "connecting, set ReverseServiceDiscovery = false on the server (README: BlueZ configuration)");
+    }
     if (state == BINC_DISCONNECTED) quit(tunnel_up ? 0 : 255);
 }
 

@@ -212,7 +212,10 @@ AutoEnable = true
   client exposes a service that needs encryption (BlueZ's built-in BLE-MIDI service does,
   for example) and the client isn't pairable, the server asks for pairing, the pairing
   fails, and the kernel drops the link with "Authentication Failure" before the tunnel
-  comes up. The tunnel never needs the client's services, so turning this off is safe.
+  comes up. Windows 11 exposes such a service too (Media Control): there the link usually
+  drops a few seconds after the tunnel is up, so a session stops in the middle, e.g. a
+  download after some KiB, and the client says "the link dropped while the session was
+  open". The tunnel never needs the client's services, so turning this off is safe.
 - **`AutoEnable = true`:** powers the adapter on at boot, so the service can advertise
   without anyone logging in.
 

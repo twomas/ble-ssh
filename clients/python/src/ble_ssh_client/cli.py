@@ -30,6 +30,11 @@ MIN_CHUNK = 20
 MAX_CHUNK = 512
 READ_CHUNK = 4096
 STDIN_QUEUE_DEPTH = 16  # x READ_CHUNK bytes buffered before stdin reads block
+# Same text as the C client's: the usual cause is a server without ReverseServiceDiscovery = false,
+# whose bluetoothd reads this computer's own GATT services (Windows 11 has one that needs
+# pairing), fails to pair and drops the link a few seconds in.
+LINK_DROPPED = ("the link dropped while the session was open; if this happens a few seconds after "
+                "connecting, set ReverseServiceDiscovery = false on the server (README: BlueZ configuration)")
 
 MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-([0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$")  # macOS device ids
@@ -275,18 +280,24 @@ async def run(args: argparse.Namespace) -> int:
         await asyncio.wait_for(pair_and_reconnect(device, args.timeout), args.timeout * 2)
 
     disconnected = asyncio.Event()
+    ending: list = []  # set when we end the session ourselves, so `disconnected` isn't a drop
+
+    def end_session() -> None:
+        ending.append(True)
+        disconnected.set()
+
     if sys.platform != "win32":
         # ssh sends SIGHUP to its ProxyCommand when the session ends; treat it (and SIGTERM)
         # like a closed link so the finally-block below still unsubscribes and disconnects.
         import signal
 
         for sig in (signal.SIGHUP, signal.SIGTERM):
-            loop.add_signal_handler(sig, disconnected.set)
+            loop.add_signal_handler(sig, end_session)
     def on_notify(_: object, data: bytearray) -> None:
         try:
             write_stdout(bytes(data))
         except OSError:  # ssh went away
-            disconnected.set()
+            end_session()
 
     opened = await open_tunnel(args, disconnected, on_notify)
     if opened is None:
@@ -314,6 +325,10 @@ async def run(args: argparse.Namespace) -> int:
         if pump_task in done and pump_task.exception() is not None:
             log(f"write failed: {pump_task.exception()}")
             return 255
+        if link_task in done and pump_task not in done and not ending:
+            # ssh still had the session open (our stdin), and the server keeps the link when a
+            # session ends, so this is a drop: what was in flight is lost.
+            log(LINK_DROPPED)
         return 0
     except (BleakError, OSError) as error:
         log(str(error))
