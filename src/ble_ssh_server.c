@@ -7,7 +7,8 @@
  *
  * With --l2cap the server also listens on an LE L2CAP channel (credit based flow control) and
  * publishes its PSM in a GATT characteristic: clients that can open such a channel use it, and
- * every channel is a session of its own (see ble_ssh_l2cap.h). GATT sessions keep working.
+ * every channel is a session of its own (l2cap_tunnel.c; the protocol is in ble_ssh_l2cap.h).
+ * GATT sessions keep working.
  *
  * With --pty CMD (prototype) every session runs CMD (normally /bin/login) on a pseudo terminal
  * of its own instead of connecting to sshd: a serial console over BLE, which any terminal app
@@ -19,7 +20,7 @@
  *                       [--pty CMD] [--nus] [--verbose]
  */
 
-#define _GNU_SOURCE // accept4
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
@@ -42,7 +43,7 @@
 #include "logger.h"
 
 #include "ble_ssh.h"
-#include "ble_ssh_l2cap.h"
+#include "l2cap_tunnel.h"
 #include "sd_notify.h"
 
 #define TX_HIGH_WATER (32 * 1024)
@@ -85,22 +86,17 @@ static const char *svc_uuid = BLE_SSH_SERVICE_UUID;
 static const char *rx_uuid = BLE_SSH_RX_UUID;
 static const char *tx_uuid = BLE_SSH_TX_UUID;
 
-// A session over an L2CAP channel: the channel is the session, so it starts at accept() and
-// ends when either side closes. No GATT involved.
+// A session over an L2CAP channel (l2cap_tunnel.c): the channel is the session, so it starts
+// when the channel opens and ends when either side closes it. No GATT involved.
 typedef struct {
-    gchar *address;      // central's address, upper case
-    int ch;              // the L2CAP channel
-    int fd;              // TCP connection to sshd, or the pty's master with --pty
-    GPid pid;            // with --pty: the program on the pty
-    guint ch_watch;      // channel readable
-    guint out_watch;     // channel writable again, while to_ch waits for credits
-    guint fd_watch;      // sshd readable, 0 while paused for back-pressure
-    guint16 sndmtu;      // largest SDU the central accepts
-    GByteArray *to_ch;   // bytes from sshd not yet sent on the channel
-    gboolean backend_eof; // sshd closed: end the session once to_ch is sent
-    guint drain_source;  // after backend_eof: waiting for the kernel to send its queue
-    guint drain_tries;
-    guint hangup_retry;  // --pty: reading again after a passing hangup (login's vhangup)
+    L2capConn *conn;      // the channel
+    gchar *address;       // central's address, upper case
+    int fd;               // TCP connection to sshd, or the pty's master with --pty
+    GPid pid;             // with --pty: the program on the pty
+    guint fd_watch;       // sshd readable, 0 while paused for back-pressure
+    guint hangup_retry;   // --pty: reading again after a passing hangup (login's vhangup)
+    gboolean backend_eof; // sshd closed: the channel closes once its queue is sent
+    gchar *end_reason;    // why we closed the channel, for the log
     guint64 bytes_in;
     guint64 bytes_out;
 } L2Session;
@@ -111,8 +107,7 @@ static Advertisement *advertisement = NULL;
 static Application *app = NULL;
 static GHashTable *sessions = NULL; // address -> Session*
 static GList *l2_sessions = NULL;   // L2Session*
-static int l2_listen_fd = -1;
-static guint l2_listen_watch = 0;
+static L2capTunnel *l2_tunnel = NULL;
 static guint16 l2_psm = 0;
 static int exit_code = 0;
 
@@ -443,32 +438,37 @@ static gboolean central_is_bonded(const char *address) {
 }
 
 // ---------------------------------------------------------------------------------------
-// L2CAP channels (--l2cap)
+// L2CAP channels (--l2cap), through l2cap_tunnel.c
 
-static gboolean l2_flush(L2Session *s);
+static void l2_resume_reading(L2Session *s);
+
+static void l2_session_free(L2Session *s, const char *reason) {
+    msg("%s: L2CAP session closed (%s), %" G_GUINT64_FORMAT " bytes in, %" G_GUINT64_FORMAT " bytes out", s->address,
+        reason, s->bytes_in, s->bytes_out);
+    if (s->fd_watch != 0) g_source_remove(s->fd_watch);
+    if (s->hangup_retry != 0) g_source_remove(s->hangup_retry);
+    close_backend(s->fd, s->pid);
+    l2_sessions = g_list_remove(l2_sessions, s);
+    g_free(s->end_reason);
+    g_free(s->address);
+    g_free(s);
+    notify_status();
+}
+
+// End the session from our side: the tunnel sends what is queued, then closes the channel;
+// on_l2_disconnected() follows.
+static void l2_end(L2Session *s, const char *reason) {
+    if (s->fd_watch != 0) g_source_remove(s->fd_watch);
+    s->fd_watch = 0;
+    if (s->end_reason == NULL) s->end_reason = g_strdup(reason);
+    l2cap_conn_close(s->conn);
+}
 
 static gboolean on_l2_hangup_retry(gpointer user_data) {
     L2Session *s = user_data;
     s->hangup_retry = 0;
-    l2_flush(s); // reads again from the pty
+    l2_resume_reading(s);
     return G_SOURCE_REMOVE;
-}
-
-static void l2_close(L2Session *s, const char *reason) {
-    msg("%s: L2CAP session closed (%s), %" G_GUINT64_FORMAT " bytes in, %" G_GUINT64_FORMAT " bytes out", s->address,
-        reason, s->bytes_in, s->bytes_out);
-    if (s->ch_watch != 0) g_source_remove(s->ch_watch);
-    if (s->out_watch != 0) g_source_remove(s->out_watch);
-    if (s->fd_watch != 0) g_source_remove(s->fd_watch);
-    if (s->drain_source != 0) g_source_remove(s->drain_source);
-    if (s->hangup_retry != 0) g_source_remove(s->hangup_retry);
-    close(s->ch);
-    close_backend(s->fd, s->pid);
-    l2_sessions = g_list_remove(l2_sessions, s);
-    g_byte_array_free(s->to_ch, TRUE);
-    g_free(s->address);
-    g_free(s);
-    notify_status();
 }
 
 static gboolean on_l2_backend_readable(gint fd, GIOCondition condition, gpointer user_data) {
@@ -484,159 +484,113 @@ static gboolean on_l2_backend_readable(gint fd, GIOCondition condition, gpointer
     if (n <= 0) {
         s->fd_watch = 0;
         if (n == 0) {
-            // l2_flush() sends what is left, then waits for the kernel to send it, then closes.
             s->backend_eof = TRUE;
             if (opt_pty != NULL) {
-                g_byte_array_append(s->to_ch, (const guint8 *) BLE_SSH_PTY_END_MARKER,
-                                    sizeof(BLE_SSH_PTY_END_MARKER) - 1);
+                l2cap_conn_send(s->conn, (const guint8 *) BLE_SSH_PTY_END_MARKER, sizeof(BLE_SSH_PTY_END_MARKER) - 1);
             }
-            l2_flush(s);
-            return G_SOURCE_REMOVE;
         }
-        l2_close(s, g_strerror(errno));
+        l2_end(s, n == 0 ? "backend closed" : g_strerror(errno));
         return G_SOURCE_REMOVE;
     }
-    g_byte_array_append(s->to_ch, buf, (guint) n);
-    if (s->to_ch->len >= TX_HIGH_WATER) {
-        // Pause reading from sshd until the channel has credits again.
+    s->bytes_out += (guint64) n;
+    l2cap_conn_send(s->conn, buf, (gsize) n);
+    if (l2cap_conn_get_queued(s->conn) >= TX_HIGH_WATER) {
+        // Pause reading from sshd until the channel has credits again (on_l2_writable).
         s->fd_watch = 0;
-        l2_flush(s);
-        return G_SOURCE_REMOVE;
-    }
-    return l2_flush(s) ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
-}
-
-static gboolean on_l2_writable(gint fd, GIOCondition condition, gpointer user_data) {
-    L2Session *s = user_data;
-    s->out_watch = 0;
-    l2_flush(s);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean on_l2_drain(gpointer user_data) {
-    L2Session *s = user_data;
-    if (ble_ssh_l2cap_unsent(s->ch) > 0 && ++s->drain_tries < BLE_SSH_L2CAP_DRAIN_TRIES) return G_SOURCE_CONTINUE;
-    s->drain_source = 0;
-    l2_close(s, s->drain_tries < BLE_SSH_L2CAP_DRAIN_TRIES ? "backend closed" : "backend closed, channel not drained");
-    return G_SOURCE_REMOVE;
-}
-
-// Send what sshd gave us, one SDU per send(). Returns FALSE if the session was closed.
-static gboolean l2_flush(L2Session *s) {
-    while (s->to_ch->len > 0) {
-        const gsize len = MIN(s->to_ch->len, s->sndmtu);
-        const ssize_t n = send(s->ch, s->to_ch->data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Out of credits: the central hasn't taken the earlier SDUs yet.
-                if (s->out_watch == 0) s->out_watch = g_unix_fd_add(s->ch, G_IO_OUT, on_l2_writable, s);
-                return TRUE;
-            }
-            l2_close(s, g_strerror(errno));
-            return FALSE;
-        }
-        g_byte_array_remove_range(s->to_ch, 0, (guint) n);
-        s->bytes_out += (guint64) n;
-    }
-    if (s->backend_eof) {
-        // All of sshd's bytes are in the kernel now; close once it has sent them.
-        if (s->drain_source == 0) s->drain_source = g_timeout_add(BLE_SSH_L2CAP_DRAIN_MS, on_l2_drain, s);
-        return TRUE;
-    }
-    if (s->fd_watch == 0 && s->hangup_retry == 0 && s->to_ch->len < TX_LOW_WATER) {
-        s->fd_watch = g_unix_fd_add(s->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_backend_readable, s);
-    }
-    return TRUE;
-}
-
-static gboolean on_l2_channel_readable(gint ch, GIOCondition condition, gpointer user_data) {
-    L2Session *s = user_data;
-    guint8 buf[BLE_SSH_L2CAP_MTU];
-    const ssize_t n = recv(ch, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
-    if (n <= 0) {
-        s->ch_watch = 0;
-        l2_close(s, n == 0 ? "channel closed" : g_strerror(errno));
-        return G_SOURCE_REMOVE;
-    }
-    s->bytes_in += (guint64) n;
-    if (!write_all(s->fd, buf, (gsize) n)) {
-        s->ch_watch = 0;
-        l2_close(s, g_strerror(errno));
         return G_SOURCE_REMOVE;
     }
     return G_SOURCE_CONTINUE;
 }
 
-static gboolean on_l2_accept(gint lfd, GIOCondition condition, gpointer user_data) {
-    struct ble_ssh_sockaddr_l2 peer = {0};
-    socklen_t len = sizeof(peer);
-    const int ch = accept4(lfd, (struct sockaddr *) &peer, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (ch < 0) {
-        if (errno != EAGAIN && errno != EINTR) msg("L2CAP accept: %s", g_strerror(errno));
-        return G_SOURCE_CONTINUE;
+static void l2_resume_reading(L2Session *s) {
+    if (s->fd_watch == 0 && s->hangup_retry == 0 && !s->backend_eof && s->end_reason == NULL &&
+        l2cap_conn_get_queued(s->conn) < TX_HIGH_WATER) {
+        s->fd_watch = g_unix_fd_add(s->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_backend_readable, s);
     }
-    char address[18];
-    ble_ssh_ba2str(&peer.l2_bdaddr, address);
+}
+
+static gboolean on_l2_accept(L2capTunnel *tunnel, const char *address, gpointer user_data) {
     if ((gint) active_sessions() >= opt_max_clients) {
         msg("%s: L2CAP channel rejected, %d clients already connected", address, opt_max_clients);
-        close(ch);
-        return G_SOURCE_CONTINUE;
+        return FALSE;
     }
-    // The listening socket demands an encrypted link with --require-bonding; as for GATT, also
-    // demand that the central is bonded, not just paired for this link.
+    // The tunnel demands an encrypted link with --require-bonding; as for GATT, also demand
+    // that the central is bonded, not just paired for this link.
     if (opt_require_bonding && !central_is_bonded(address)) {
         msg("%s: L2CAP channel rejected, not bonded (--require-bonding)", address);
-        close(ch);
-        return G_SOURCE_CONTINUE;
+        return FALSE;
     }
+    return TRUE;
+}
+
+static void on_l2_connected(L2capConn *conn, gpointer user_data) {
+    const char *address = l2cap_conn_get_address(conn);
     GPid pid = 0;
     const int fd = open_backend(&pid);
     if (fd < 0) {
         if (opt_pty != NULL) msg("%s: cannot start %s: %s", address, opt_pty, g_strerror(errno));
         else msg("%s: cannot connect to %s:%d: %s", address, opt_host, opt_port, g_strerror(errno));
-        close(ch);
-        return G_SOURCE_CONTINUE;
+        l2cap_conn_close(conn); // no session: on_l2_disconnected() ignores it
+        return;
     }
     L2Session *s = g_new0(L2Session, 1);
+    s->conn = conn;
     s->address = g_strdup(address);
-    s->ch = ch;
     s->fd = fd;
     s->pid = pid;
-    s->sndmtu = ble_ssh_l2cap_sndmtu(ch);
-    s->to_ch = g_byte_array_new();
-    s->ch_watch = g_unix_fd_add(ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_channel_readable, s);
-    s->fd_watch = g_unix_fd_add(fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_l2_backend_readable, s);
+    l2cap_conn_set_user_data(conn, s);
     l2_sessions = g_list_append(l2_sessions, s);
-    msg("%s: L2CAP session opened (send mtu %u, %u active)", s->address, s->sndmtu, active_sessions());
+    l2_resume_reading(s);
+    msg("%s: L2CAP session opened (send mtu %u, %u active)", s->address, l2cap_conn_get_mtu(conn), active_sessions());
     notify_status();
-    return G_SOURCE_CONTINUE;
 }
 
+static void on_l2_rx(L2capConn *conn, const guint8 *data, gsize len, gpointer user_data) {
+    L2Session *s = l2cap_conn_get_user_data(conn);
+    if (s == NULL) return;
+    s->bytes_in += len;
+    if (!write_all(s->fd, data, len)) l2_end(s, g_strerror(errno));
+}
+
+static void on_l2_writable(L2capConn *conn, gpointer user_data) {
+    L2Session *s = l2cap_conn_get_user_data(conn);
+    if (s != NULL) l2_resume_reading(s);
+}
+
+static void on_l2_disconnected(L2capConn *conn, const char *reason, gpointer user_data) {
+    L2Session *s = l2cap_conn_get_user_data(conn);
+    if (s == NULL) return;
+    if (g_str_equal(reason, "tunnel freed")) {
+        l2_session_free(s, "server stopping");
+    } else if (s->end_reason == NULL) {
+        l2_session_free(s, g_str_equal(reason, "channel closed by the central") ? "channel closed" : reason);
+    } else if (g_str_equal(reason, "closed")) {
+        l2_session_free(s, s->end_reason);
+    } else {
+        gchar *both = g_strdup_printf("%s, then %s", s->end_reason, reason);
+        l2_session_free(s, both);
+        g_free(both);
+    }
+}
+
+static const L2capTunnelCallbacks l2_callbacks = {
+    .accept = on_l2_accept,
+    .connected = on_l2_connected,
+    .rx = on_l2_rx,
+    .writable = on_l2_writable,
+    .disconnected = on_l2_disconnected,
+};
+
 static gboolean l2_listen(void) {
-    const uint8_t security = opt_require_bonding ? BLE_SSH_BT_SECURITY_MEDIUM : BLE_SSH_BT_SECURITY_LOW;
     // opt_psm 0: the kernel picks a free one, 0x80-0xff.
-    const int fd = ble_ssh_l2cap_socket(SOCK_NONBLOCK, security, (uint16_t) opt_psm);
-    if (fd < 0) {
-        msg("L2CAP socket on PSM %d: %s", opt_psm, g_strerror(errno));
-        return FALSE;
-    }
-    if (listen(fd, 4) < 0) {
+    l2_tunnel = l2cap_tunnel_new((guint16) opt_psm, opt_require_bonding ? L2CAP_TUNNEL_ENCRYPTED : L2CAP_TUNNEL_OPEN,
+                                 &l2_callbacks, NULL);
+    if (l2_tunnel == NULL) {
         msg("L2CAP listen on PSM %d: %s", opt_psm, g_strerror(errno));
-        close(fd);
         return FALSE;
     }
-    struct ble_ssh_sockaddr_l2 bound = {0};
-    socklen_t len = sizeof(bound);
-    if (getsockname(fd, (struct sockaddr *) &bound, &len) < 0) {
-        msg("L2CAP getsockname: %s", g_strerror(errno));
-        close(fd);
-        return FALSE;
-    }
-    l2_psm = ble_ssh_htobs(bound.l2_psm);
-    l2_listen_fd = fd;
-    l2_listen_watch = g_unix_fd_add(fd, G_IO_IN, on_l2_accept, NULL);
+    l2cap_tunnel_set_water_marks(l2_tunnel, TX_HIGH_WATER, TX_LOW_WATER);
+    l2_psm = l2cap_tunnel_get_psm(l2_tunnel);
     return TRUE;
 }
 
@@ -960,9 +914,8 @@ int main(int argc, char **argv) {
     g_list_free(open);
     g_hash_table_destroy(sessions);
     sessions = NULL;
-    while (l2_sessions != NULL) l2_close(l2_sessions->data, "server stopping");
-    if (l2_listen_watch != 0) g_source_remove(l2_listen_watch);
-    if (l2_listen_fd >= 0) close(l2_listen_fd);
+    l2cap_tunnel_free(l2_tunnel); // on_l2_disconnected() ends the sessions still open
+    l2_tunnel = NULL;
 
     if (advertisement != NULL) {
         binc_adapter_stop_advertising(adapter, advertisement);

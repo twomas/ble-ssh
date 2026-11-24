@@ -29,14 +29,19 @@ add_compile_definitions(GLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_${BLE_SSH_GLIB_AP
 # static library out of `cmake --install`; it is still built because our targets link to it.
 add_subdirectory(external/bluez_inc/binc EXCLUDE_FROM_ALL)
 
-add_executable(ble_ssh_server src/ble_ssh_server.c src/sd_notify.c)
+add_executable(ble_ssh_server src/ble_ssh_server.c src/l2cap_tunnel.c src/sd_notify.c)
 target_link_libraries(ble_ssh_server Binc)
 
 add_executable(ble_ssh_client src/ble_ssh_client.c)
 target_link_libraries(ble_ssh_client Binc)
 
+# l2cap_tunnel.c on its own (GLib only, no bluez_inc), as a program would take it; not installed.
+add_executable(l2cap_echo examples/l2cap_echo.c src/l2cap_tunnel.c)
+target_include_directories(l2cap_echo PRIVATE src)
+target_link_libraries(l2cap_echo ${GLIB_LIBRARIES})
+
 # Strict warnings for our own code only; bluez_inc keeps its upstream flags.
-foreach(target ble_ssh_server ble_ssh_client)
+foreach(target ble_ssh_server ble_ssh_client l2cap_echo)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endforeach()
 
