@@ -137,6 +137,13 @@ ssh -o ProxyCommand="ble_ssh_client --l2cap ssh-raspberrypi" pi@raspberrypi
 For the systemd service, add `--l2cap` to `BLE_SSH_OPTS`; the unit allows the Bluetooth
 sockets it needs. Measurements and what is not done yet: [docs/l2cap.md](docs/l2cap.md).
 
+**In another BLE server:** the server's side of the channels is a small library,
+`src/l2cap_tunnel.c` and `src/l2cap_tunnel.h`, that needs only GLib (no bluez_inc, D-Bus or
+BlueZ headers). A program with its own GATT server copies the two files in and gets a
+handle per channel with callbacks, a byte stream each way with back-pressure, and a close
+that sends what is queued first. `examples/l2cap_echo.c` is the smallest program on it:
+[docs/l2cap-tunnel.md](docs/l2cap-tunnel.md).
+
 ### Console on a pty (`--pty`, prototype)
 
 With `--pty CMD` every session runs CMD, normally `/bin/login`, on a pseudo terminal of its
