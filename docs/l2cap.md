@@ -1,7 +1,7 @@
 # L2CAP channels (prototype)
 
-Status: prototype on the `l2cap-prototype` branch, Linux C server and C client only. GATT is
-unchanged and stays the default; everything here is opt-in with `--l2cap`.
+Status: prototype on main, Linux C server and C client only. GATT is unchanged and stays
+the default; everything here is opt-in with `--l2cap`.
 
 ## What it does
 
@@ -11,8 +11,8 @@ based flow control) and publishes its PSM in a read-only characteristic,
 connects over BLE as before, reads the PSM and opens a channel to it. The channel carries
 the SSH bytes as they are; closing it ends the session.
 
-- **One channel, one session.** The server's `accept()` gives a socket per channel, and
-  each gets its own connection to sshd.
+- **One channel, one session.** Every channel the server accepts gets its own connection
+  to sshd (or its own program on a pty, with `--pty`).
 - **Channels share the link.** A second client on the same machine joins the link that is
   already up, instead of being refused as with GATT. It never disconnects a link it joined.
 - **Falls back to GATT** when the server offers no PSM (an older server, or no `--l2cap`),
@@ -23,8 +23,13 @@ the SSH bytes as they are; closing it ends the session.
   `systemctl status` shows e.g. `2/4 clients connected (1 over L2CAP)`.
 - **`--psm N`** picks the PSM (128-255); by default the kernel picks a free one.
 
-The socket definitions are written out in `src/ble_ssh_l2cap.h`, so neither program needs
-libbluetooth. The systemd unit allows `AF_BLUETOOTH` for this.
+The server's side of the channels is [`l2cap_tunnel`](l2cap-tunnel.md)
+(`src/l2cap_tunnel.c`/`.h`): listening, one handle per channel, the send queue and its
+credits, and the wait for the kernel's queue before closing. `ble_ssh_server` only connects
+its callbacks to sshd or the pty. The library needs GLib and nothing else, so other BLE
+servers can use it too. The client keeps its own socket code, with the definitions written
+out in `src/ble_ssh_l2cap.h`; neither program needs libbluetooth. The systemd unit allows
+`AF_BLUETOOTH` for this.
 
 ```bash
 ble_ssh_server --l2cap                                  # on the server
@@ -65,7 +70,8 @@ connection interval was 48.75 ms (bluetoothd's default 30-50 ms) and the data le
   type, so the socket is bound first, also on the client.
 - `close()` drops what the kernel still has queued for an LE channel (SDUs waiting for
   credits): the last few KiB of a download were lost. Both sides now wait until the queue
-  is empty (`TIOCOUTQ` against `SO_SNDBUF`) before they close, at most 5 s.
+  is empty (`TIOCOUTQ` against `SO_SNDBUF`) before they close, at most 5 s; on the server,
+  `l2cap_conn_close()` does this.
 - BlueZ signals a characteristic's notifications to every process watching the device, so
   a client that joined a shared link ignores TX notifications: they belong to another
   client's GATT session.
