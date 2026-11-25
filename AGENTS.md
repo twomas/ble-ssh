@@ -11,6 +11,8 @@ covers what isn't obvious from them.
 | `src/ble_ssh_server.c` | GATT server: one session per TX subscription (and with `--l2cap` per L2CAP channel), bridged to sshd over TCP |
 | `src/ble_ssh_client.c` | Linux C client (BlueZ via bluez_inc), used as ssh `ProxyCommand` |
 | `src/ble_ssh.h` | UUIDs and sizes shared by both C programs |
+| `src/l2cap_tunnel.c/.h` | Server side of LE L2CAP channels on GLib, no bluez_inc: used by `--l2cap`, and meant to be copied into other BLE servers ([docs/l2cap-tunnel.md](docs/l2cap-tunnel.md)) |
+| `examples/l2cap_echo.c` | Smallest program on `l2cap_tunnel` |
 | `src/ble_ssh_l2cap.h` | LE L2CAP socket definitions and helpers (`--l2cap`), written out so libbluetooth isn't needed |
 | `clients/python/` | Cross-platform client (`ble-ssh-client`) and tkinter GUI (`ble-ssh-gui`), built on bleak |
 | `external/bluez_inc/` | Submodule: our fork of bluez_inc, the BlueZ D-Bus wrapper |
