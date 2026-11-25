@@ -191,28 +191,59 @@ jobs:
           cat dist/SHA256SUMS
 
       - name: Publish release
+        # `gh release upload --clobber` deletes an asset before uploading its replacement, so a
+        # failed upload (it happened once, from GitHub's side) left a release without its
+        # binaries. Upload under temporary names first, retrying, and only then swap them in;
+        # a failure leaves the previous files in place, and a re-run finishes the job.
         run: |
           set -e
+          retry() {
+            for attempt in 1 2 3 4; do
+              "$@" && return 0
+              [ "$attempt" = 4 ] && break
+              echo "::warning::attempt $attempt failed: $*; retrying"
+              sleep $((attempt * 10))
+            done
+            echo "::error::failed after 4 attempts: $*"
+            return 1
+          }
+          # Replace the release's assets with dist/*, and drop those dist/ doesn't have.
+          publish_assets() {
+            local tag=$1 staged=staged name url
+            rm -rf "$staged" && mkdir "$staged"
+            for f in dist/*; do cp "$f" "$staged/$(basename "$f").new"; done
+            retry gh release upload "$tag" "$staged"/* --clobber
+            # The REST API's asset URLs: what renaming and deleting an asset take.
+            retry gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.assets[] | "\(.name) \(.url)"' > assets.txt
+            for f in dist/*; do
+              name=$(basename "$f")
+              url=$(awk -v n="$name" '$1 == n {print $2}' assets.txt)
+              [ -z "$url" ] || retry gh api -X DELETE "$url"
+              url=$(awk -v n="$name.new" '$1 == n {print $2}' assets.txt)
+              retry gh api -X PATCH "$url" -f name="$name" > /dev/null
+            done
+            # Drop what this build no longer has: the wheel's name changes with every commit.
+            while read -r name url; do
+              [ -e "dist/$name" ] || [ -e "dist/${name%.new}" ] || retry gh api -X DELETE "$url"
+            done < assets.txt
+          }
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             tag=$GITHUB_REF_NAME
             if gh release view "$tag" > /dev/null 2>&1; then
-              gh release upload "$tag" dist/* --clobber
+              publish_assets "$tag"
             else
-              gh release create "$tag" dist/* --verify-tag --title "ble-ssh $tag" --generate-notes
+              retry gh release create "$tag" dist/* --verify-tag --title "ble-ssh $tag" --generate-notes
             fi
           else
             tag=main-latest
             notes="Newest build of main, from ${GITHUB_SHA::7}. Replaced on every push to main."
             if gh release view "$tag" > /dev/null 2>&1; then
-              gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true
-              gh release edit "$tag" --prerelease --notes "$notes"
-              gh release upload "$tag" dist/* --clobber
-              # Drop what this build no longer has: the wheel's name changes with every commit.
-              gh release view "$tag" --json assets --jq '.assets[].name' | while read -r asset; do
-                [ -e "dist/$asset" ] || gh release delete-asset "$tag" "$asset" --yes
-              done
+              publish_assets "$tag"
+              # Move the tag only once the files are there, so tag and files always match.
+              retry gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true
+              retry gh release edit "$tag" --prerelease --notes "$notes"
             else
-              gh release create "$tag" dist/* --prerelease --target "$GITHUB_SHA" \
+              retry gh release create "$tag" dist/* --prerelease --target "$GITHUB_SHA" \
                 --title "Latest build of main" --notes "$notes"
             fi
           fi
