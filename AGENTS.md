@@ -42,7 +42,8 @@ not a fix for a build error. After a push, the `release` job publishes the same 
 `vX.Y.Z` gets its own release, and main updates the pre-release `main-latest`. CI also
 shellchecks both scripts, and
 smoke-tests the Python client on Linux, Windows and macOS with the oldest and newest
-supported Python (3.10 and 3.14). The runners have no Bluetooth, so
+supported Python (3.10 and 3.14), and runs its unit tests (`clients/python/tests`, no
+Bluetooth or ffmpeg needed) there. The runners have no Bluetooth, so
 anything that touches BLE has to be tested on real hardware (see below).
 
 ## Rules

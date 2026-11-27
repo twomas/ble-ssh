@@ -21,7 +21,7 @@ from typing import List, Optional
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
 except ImportError:  # e.g. Debian/Ubuntu without python3-tk
     tk = None
 
@@ -174,9 +174,16 @@ class App:
         ttk.Button(buttons, text="Connect", command=self.connect).pack(side="left")
         ttk.Button(buttons, text="Add to ~/.ssh/config", command=self.save_alias).pack(side="left", padx=6)
         ttk.Button(buttons, text="Copy ssh command", command=self.copy_command).pack(side="left")
+        if sys.platform == "linux":
+            video_buttons = ttk.Frame(frame)
+            video_buttons.grid(row=4, column=0, sticky="w", pady=(6, 0))
+            ttk.Button(video_buttons, text="Stream video",
+                       command=self.stream_video).pack(side="left", padx=(0, 6))
+            ttk.Button(video_buttons, text="Stream camera",
+                       command=lambda: self.stream_video(camera=True)).pack(side="left")
 
         self.status = tk.StringVar(value="Press Scan to look for ble-ssh servers.")
-        ttk.Label(frame, textvariable=self.status, foreground="gray").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.status, foreground="gray").grid(row=5, column=0, sticky="w", pady=(8, 0))
 
     # Scanning runs bleak in its own thread and event loop so the window stays responsive. The
     # list fills in live: devices at the edge of range are often only heard now and then.
@@ -320,6 +327,46 @@ class App:
             self.status.set(f"Opened ssh to {target} in a new window.")
         except OSError as error:
             messagebox.showerror("BLE SSH", f"Could not start ssh: {error}")
+
+    def stream_video(self, camera: bool = False) -> None:
+        target = self.current_target()
+        if target is None:
+            return
+        client = shutil.which("ble_ssh_client")
+        if client is None:
+            client = filedialog.askopenfilename(title="On this PC: select ble_ssh_client (not a remote file)")
+            if not client:
+                return
+        if shutil.which("ffplay") is None:
+            messagebox.showerror("BLE SSH", "Video playback needs ffplay (install ffmpeg).")
+            return
+        if camera:
+            remote = simpledialog.askstring(
+                "Stream camera", "Camera URL on the target (read over BLE, not directly by this PC):",
+                initialvalue="http://127.0.0.1:8080/camera", parent=self.root,
+            )
+        else:
+            remote = simpledialog.askstring("Stream video", "Video file on the server:", parent=self.root)
+        if not remote:
+            return
+        user = self.user.get().strip()
+        argv = [sys.executable, "-m", "ble_ssh_client.video", target, remote,
+                "--client", client, "--user", user, "--camera" if camera else "--stream"]
+
+        def launch_video() -> None:
+            try:
+                open_in_terminal(argv)
+                self.status.set("Video stream opened; playback starts as data arrives.")
+            except OSError as error:
+                messagebox.showerror("BLE SSH", f"Could not start video stream: {error}")
+
+        if user:
+            save_user(target, user)
+        if self.scanning:
+            self.stop_scan()
+            self.after_scan = launch_video
+        else:
+            launch_video()
 
     def save_alias(self) -> None:
         target = self.current_target()
