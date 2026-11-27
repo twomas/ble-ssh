@@ -81,6 +81,49 @@ ble-ssh-gui
   terminal. **Copy ssh command** puts the full command on the clipboard.
 - The login user is remembered per server. Left empty, ssh uses your local user name, which
   is rarely the right one on the server.
+- **Stream video** (Linux) plays the remote video as it arrives, without downloading a
+  complete file first or asking for a save location. The target needs ffmpeg: it reads the
+  file at playback speed and remuxes video into a pipe-friendly Matroska stream. No
+  transcoding is done, so choose a video bitrate below the BLE link's throughput. Audio
+  is omitted. Close the player or press Ctrl+C in the terminal to stop.
+- **Stream camera** (Linux) reads the target's live HTTP camera feed through SSH over
+  BLE/L2CAP, not through a direct PC-to-camera HTTP connection. The default source is
+  `http://127.0.0.1:8080/camera`, where loopback refers to the target. Enable the target's
+  camera broadcaster first (this action does not change its settings). Target ffmpeg
+  scales/pads the feed to 320x180 at 10 fps, preserving aspect ratio (including a
+  side-by-side stereo feed), and encodes MPEG-4 at 160 kbit/s with a
+  200 kbit/s maximum rate setting. Audio is omitted; close the player to stop the
+  streaming process. The broadcaster itself remains enabled.
+
+Both video actions use the **C client** with `--l2cap`. Install ffmpeg on the PC for
+`ffplay`, and run the target server with `--l2cap`. If `ble_ssh_client` is not on PATH,
+select its executable (for example `build/ble_ssh_client`). SSH authentication and
+host-key prompts appear in a terminal; the GUI stays responsive. Finish other BLE
+sessions before starting. The C client can fall back to GATT; its verbose terminal
+output shows which transport was actually used. General file transfers are left to
+existing tools such as `scp` and `sftp` over an SSH alias, rather than a built-in file manager.
+For device names containing spaces or SSH-special characters, video actions use a
+stable hashed SSH hostname while passing the original name to the BLE client.
+Addresses and SSH-safe names retain their existing SSH host identity.
+
+The same video action can be run directly on Linux:
+
+```bash
+python -m ble_ssh_client.video AA:BB:CC:DD:EE:FF /tmp/video.mp4 ./video.mp4 \
+    --user pi --client ./build/ble_ssh_client
+
+python -m ble_ssh_client.video AA:BB:CC:DD:EE:FF /tmp/video.mp4 --stream \
+    --user pi --client ./build/ble_ssh_client
+
+python -m ble_ssh_client.video AA:BB:CC:DD:EE:FF http://127.0.0.1:8080/camera --camera \
+    --user pi --client ./build/ble_ssh_client
+```
+
+In download mode, playback starts only after the complete file is verified. A failed
+download leaves an existing destination untouched. Add `--no-play` to only download;
+`--ssh-option KEY=VALUE` passes an SSH setting such as `HostKeyAlias=ssh-server`.
+Downloads have a 30-minute timeout. Streaming has no whole-file checksum or time limit;
+SSH protects transport integrity, and SSH/player failures are reported in the terminal.
 
 Terminals: `cmd` on Windows, Terminal.app on macOS, and on Linux the desktop's
 `x-terminal-emulator`, or ptyxis, gnome-terminal, kgx, konsole, xfce4-terminal or xterm.
@@ -105,8 +148,9 @@ The C client's `--nus`, for servers that offer the Nordic UART Service (`--nus`,
 prototype), isn't here yet; this client reaches a console server started without `--nus`.
 
 The C client's `--l2cap` (sessions over an L2CAP channel, for servers started with
-`--l2cap`) has no counterpart here: bleak, and Windows itself, have no API for LE L2CAP
-channels. This client always uses GATT, which every server offers, also next to L2CAP; see
+`--l2cap`) has no counterpart in the Python tunnel: bleak, and Windows itself, have no API
+for LE L2CAP channels. The Python tunnel always uses GATT; the Linux video actions
+instead delegate transport to the C client. Every server offers GATT, also next to L2CAP; see
 [L2CAP channels](../../README.md#l2cap-channels---l2cap-prototype).
 
 ## Platform notes
